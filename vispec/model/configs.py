@@ -96,6 +96,8 @@ class EConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
+        num_hidden_levels=3,
+        vis_select_tokens=64,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -104,6 +106,8 @@ class EConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.num_hidden_levels = num_hidden_levels
+        self.vis_select_tokens = vis_select_tokens
 
         # for backward compatibility
         if num_key_value_heads is None:

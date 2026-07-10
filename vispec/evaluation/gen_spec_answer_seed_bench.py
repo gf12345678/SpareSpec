@@ -23,6 +23,17 @@ from ..model.utils import *
 from .seed_bench_prompt import build_prompt
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 def load_data(args):
     data = []
     with open(os.path.join(args.data_folder, "llava-seed-bench.jsonl"), "r") as f:
@@ -107,7 +118,28 @@ def get_model_answers(
 ):
     # temperature = 0.0
 
-    if args.use_ours:
+    if args.use_sparespec:
+        from ..model.spec_model_sparespec import SpecModel
+
+        model = SpecModel.from_pretrained(
+            base_model_path=base_model_path,
+            spec_model_path=spec_model_path,
+            total_token=args.total_token,
+            depth=args.depth,
+            top_k=args.top_k,
+            torch_dtype="auto",
+            low_cpu_mem_usage=True,
+            # load_in_8bit=True,
+            device_map="auto",
+            num_q=args.num_q,
+            vis_select_tokens=args.vis_select_tokens,
+            num_hidden_levels=args.num_hidden_levels,
+            min_vis_select_tokens=args.min_vis_select_tokens,
+            vis_entropy_alpha=args.vis_entropy_alpha,
+            vis_query_window=args.vis_query_window,
+            max_total_vis_select_tokens=args.max_total_vis_select_tokens,
+        )
+    elif args.use_ours:
         from ..model.spec_model_ours import SpecModel
 
         model = SpecModel.from_pretrained(
@@ -384,10 +416,17 @@ if __name__ == "__main__":
         default="mc_sim_7b_63",
     )
 
-    parser.add_argument("--image-fc", type=bool, default=False)
-    parser.add_argument("--use-ours", type=bool, default=False)
+    parser.add_argument("--image-fc", type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("--use-ours", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--num-q", type=int, default=2)
-    parser.add_argument("--use-medusa", type=bool, default=False)
+    parser.add_argument("--use-medusa", type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("--use-sparespec", type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("--num-hidden-levels", type=int, default=3)
+    parser.add_argument("--vis-select-tokens", type=int, default=64)
+    parser.add_argument("--min-vis-select-tokens", type=int, default=16)
+    parser.add_argument("--vis-entropy-alpha", type=float, default=1.2)
+    parser.add_argument("--vis-query-window", type=int, default=8)
+    parser.add_argument("--max-total-vis-select-tokens", type=int, default=0)
 
     parser.add_argument("--data-folder", type=str, default="data/seed_bench")
 

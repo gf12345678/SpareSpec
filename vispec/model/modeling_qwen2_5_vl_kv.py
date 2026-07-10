@@ -565,9 +565,51 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         return window_index, cu_window_seqlens
 
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+    @staticmethod
+    def _compute_anchor_attention_scores(
+        hidden_states: torch.Tensor,
+        block: "Qwen2_5_VLVisionBlock",
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        """Compute mean self-attention scores at a single ViT layer for anchor selection."""
+        attn = block.attn
+        seq_length = hidden_states.shape[0]
+        q, k, _ = (
+            attn.qkv(hidden_states)
+            .reshape(seq_length, 3, attn.num_heads, -1)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = q.transpose(0, 1).float()
+        k = k.transpose(0, 1).float()
+
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(q.shape[-1])
+        attention_mask = torch.full(
+            [1, seq_length, seq_length],
+            torch.finfo(attn_weights.dtype).min,
+            device=attn_weights.device,
+            dtype=attn_weights.dtype,
+        )
+        cu_seqlens = cu_seqlens.to(device=attn_weights.device)
+        for i in range(1, len(cu_seqlens)):
+            start = int(cu_seqlens[i - 1].item())
+            end = int(cu_seqlens[i].item())
+            attention_mask[..., start:end, start:end] = 0
+
+        attn_weights = nn.functional.softmax(
+            attn_weights + attention_mask, dim=-1, dtype=torch.float32
+        )
+        return attn_weights.mean(dim=(0, 1))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        return_anchor: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
@@ -614,11 +656,16 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
+        anchor_scores = None
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
             else:
                 cu_seqlens_now = cu_window_seqlens
+            if return_anchor and layer_num == len(self.blocks) - 2:
+                anchor_scores = self._compute_anchor_attention_scores(
+                    blk.norm1(hidden_states), blk, cu_seqlens_now, position_embeddings
+                )
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
                     blk.__call__,
@@ -634,10 +681,21 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                     position_embeddings=position_embeddings,
                 )
 
-        hidden_states = self.merger(hidden_states)
-        reverse_indices = torch.argsort(window_index)
-        hidden_states = hidden_states[reverse_indices, :]
+        merged_hidden_states = self.merger(hidden_states)
+        vis_anchor = None
+        if return_anchor and anchor_scores is not None:
+            anchor_token_idx = int(torch.argmax(anchor_scores).item())
+            anchor_group_idx = min(
+                anchor_token_idx // self.spatial_merge_unit,
+                merged_hidden_states.shape[0] - 1,
+            )
+            vis_anchor = merged_hidden_states[anchor_group_idx : anchor_group_idx + 1]
 
+        reverse_indices = torch.argsort(window_index)
+        hidden_states = merged_hidden_states[reverse_indices, :]
+
+        if return_anchor:
+            return hidden_states, vis_anchor
         return hidden_states
 
 

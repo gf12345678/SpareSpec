@@ -271,15 +271,40 @@ def initialize_tree(
     inputs_embeds=None,
     embed_weights=None,
     image_mask=None,
+    text_attn_vis=None,
+    text_vis_attn=None,
+    vis_attn_scores=None,
+    query_token_mask=None,
+    vis_anchor=None,
     **kwargs,
 ):
-    outputs, orig, hidden_states = model(
-        input_ids,
-        past_key_values=past_key_values,
-        output_orig=True,
-        inputs_embeds=inputs_embeds,
-        **kwargs,
+    if text_attn_vis is None:
+        text_attn_vis = text_vis_attn
+
+    should_collect_attn = (
+        text_attn_vis is None and vis_attn_scores is None and image_mask is not None
     )
+    if should_collect_attn:
+        outputs, orig, hidden_states, base_attentions = model(
+            input_ids,
+            past_key_values=past_key_values,
+            output_orig=True,
+            inputs_embeds=inputs_embeds,
+            return_attentions=True,
+            **kwargs,
+        )
+        if base_attentions is not None and len(base_attentions) > 0:
+            # Use middle LLM layer's attention for vision token selection
+            middle_idx = len(base_attentions) // 2
+            text_attn_vis = base_attentions[middle_idx]
+    else:
+        outputs, orig, hidden_states = model(
+            input_ids,
+            past_key_values=past_key_values,
+            output_orig=True,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
 
     if logits_processor is not None:
         logits = orig[:, -1]
@@ -302,6 +327,10 @@ def initialize_tree(
                 inputs_embeds=inputs_embeds,
                 # embed_weights=embed_weights,
                 image_mask=image_mask,
+                text_attn_vis=text_attn_vis,
+                vis_attn_scores=vis_attn_scores,
+                query_token_mask=query_token_mask,
+                vis_anchor=vis_anchor,
             )
         )
     except:
@@ -314,6 +343,10 @@ def initialize_tree(
                 inputs_embeds=inputs_embeds,
                 # embed_weights=embed_weights,
                 image_mask=image_mask,
+                text_attn_vis=text_attn_vis,
+                vis_attn_scores=vis_attn_scores,
+                query_token_mask=query_token_mask,
+                vis_anchor=vis_anchor,
             )
         )
     return (
@@ -507,9 +540,13 @@ def update_inference_inputs(
     model,
     hidden_state_new,
     sample_p,
+    vis_anchor=None,
+    image_mask=None,
+    text_attn_vis=None,
+    vis_attn_scores=None,
+    query_token_mask=None,
     # inputs_embeds=None,
     # embed_weights=None,
-    # image_mask=None,
 ):
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
@@ -561,9 +598,13 @@ def update_inference_inputs(
                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
                 head=model.base_model.lm_head,
                 logits_processor=logits_processor,
+                vis_anchor=vis_anchor,
+                image_mask=image_mask,
+                text_attn_vis=text_attn_vis,
+                vis_attn_scores=vis_attn_scores,
+                query_token_mask=query_token_mask,
                 # inputs_embeds=inputs_embeds,
                 # embed_weights=embed_weights,
-                # image_mask=image_mask,
             )
         )
     else:
@@ -573,9 +614,13 @@ def update_inference_inputs(
                 input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
                 head=model.base_model.language_model.lm_head,
                 logits_processor=logits_processor,
+                vis_anchor=vis_anchor,
+                image_mask=image_mask,
+                text_attn_vis=text_attn_vis,
+                vis_attn_scores=vis_attn_scores,
+                query_token_mask=query_token_mask,
                 # inputs_embeds=inputs_embeds,
                 # embed_weights=embed_weights,
-                # image_mask=image_mask,
             )
         )
 
