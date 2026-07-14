@@ -642,6 +642,75 @@ class ImgAdaptor(nn.Module):
         return attn_output
 
 
+class CrossAttentionPooling(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+
+        if hasattr(config, "qkv_bias"):
+            bias = config.qkv_bias
+        else:
+            bias = False
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=bias
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=bias
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=bias
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
+    def forward(self, visual_states: torch.Tensor, query_states: torch.Tensor):
+        if visual_states.dim() != 3:
+            raise ValueError("visual_states should have shape [batch, num_vis, hidden]")
+        if query_states.dim() == 2:
+            query_states = query_states.unsqueeze(1)
+        elif query_states.dim() != 3:
+            raise ValueError(
+                "query_states should have shape [batch, hidden] or [batch, num_q, hidden]"
+            )
+        if visual_states.shape[0] != query_states.shape[0]:
+            raise ValueError("visual_states and query_states batch size should match")
+        if visual_states.shape[-1] != self.hidden_size:
+            raise ValueError("visual_states hidden size should match model hidden size")
+        if query_states.shape[-1] != self.hidden_size:
+            raise ValueError("query_states hidden size should match model hidden size")
+
+        bsz, num_vis, _ = visual_states.size()
+        num_q = query_states.shape[1]
+
+        query_states = self.q_proj(query_states)
+        key_states = self.k_proj(visual_states)
+        value_states = self.v_proj(visual_states)
+
+        query_states = query_states.view(
+            bsz, num_q, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, num_vis, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, num_vis, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query=query_states.contiguous(),
+            key=key_states.contiguous(),
+            value=value_states.contiguous(),
+            is_causal=False,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, num_q, self.hidden_size)
+        return self.o_proj(attn_output)
+
 
 class Model(nn.Module):
 
@@ -748,21 +817,13 @@ class Model(nn.Module):
 
         # Kept for checkpoint backward-compatibility with EAGLE/ViSpec checkpoints.
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
-        # Visual-conditioned token transition: [next_token_embedding, g/a, vis_anchor] -> draft hidden.
+        # Global visual anchor fusion: [next_token_embedding, g/a, vis_anchor] -> draft hidden.
         self.anchor_fc = nn.Linear(
             3 * config.hidden_size, config.hidden_size, bias=bias
         )
         self._reset_anchor_fc_from_fc()
 
-        self.vis_token_norm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.vis_token_adapter = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * 4, bias=bias),
-            ACT2FN[config.hidden_act],
-            nn.Linear(config.hidden_size * 4, config.hidden_size, bias=bias),
-        )
-        self.vis_token_gate = nn.Parameter(torch.zeros(1))
+        self.vis_detail_pooler = CrossAttentionPooling(config)
 
         self.imadpt = ImgAdaptor(config, num_q)
         self.img_fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
@@ -779,6 +840,7 @@ class Model(nn.Module):
             param.requires_grad = False
 
         self.last_img_hidden = None
+        self.last_vis_detail = None
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
@@ -1058,8 +1120,25 @@ class Model(nn.Module):
 
         return self.text_mlp(multi_level_hidden)
 
+    def _build_text_context(self, hidden_states):
+        hidden_dim = hidden_states.shape[-1]
+        if hidden_dim == self.num_hidden_levels * self.hidden_size:
+            return self._fuse_multilevel_text_tokens(hidden_states)
+        if hidden_dim == self.hidden_size:
+            return hidden_states
+        raise ValueError(
+            "hidden_states last dimension should be either "
+            f"{self.num_hidden_levels * self.hidden_size} for multi-level target "
+            f"states or {self.hidden_size} for draft autoregressive states, "
+            f"got {hidden_dim}"
+        )
+
     def _merge_token_and_hidden(
-        self, inputs_embeds, hidden_context, vis_anchor=None, batch_idx=None
+        self,
+        inputs_embeds,
+        hidden_context,
+        vis_anchor=None,
+        batch_idx=None,
     ):
         if hidden_context.numel() == 0:
             return hidden_context
@@ -1087,47 +1166,72 @@ class Model(nn.Module):
             anchor = self._expand_anchor_like(
                 hidden_context, vis_anchor=vis_anchor, batch_idx=batch_idx
             )
-        return self.anchor_fc(torch.cat((inputs_embeds, hidden_context, anchor), dim=-1))
 
-    def _adapt_visual_tokens(self, visual_embeds):
+        return self.anchor_fc(
+            torch.cat((inputs_embeds, hidden_context, anchor), dim=-1)
+        )
+
+    def _build_visual_pool_query(
+        self, hidden_states, image_mask, query_token_mask, batch_idx
+    ):
+        seq_ids = torch.arange(image_mask.shape[1], device=image_mask.device)
+        text_ids = None
+        if query_token_mask is not None:
+            text_ids = seq_ids[query_token_mask[batch_idx] & ~image_mask[batch_idx]]
+        if text_ids is None or text_ids.numel() == 0:
+            text_ids = seq_ids[~image_mask[batch_idx]]
+        if text_ids.numel() == 0:
+            return torch.zeros(
+                1,
+                self.hidden_size,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        query_window = min(self.vis_query_window, text_ids.numel())
+        text_ids = text_ids[-query_window:]
+        text_context = self._build_text_context(hidden_states[batch_idx, text_ids])
+        return text_context.mean(dim=0, keepdim=True)
+
+    def _pool_selected_visual_tokens(self, visual_embeds, query_context):
         if visual_embeds.numel() == 0:
-            return visual_embeds
+            return None
+        if query_context is None or query_context.numel() == 0:
+            query_context = torch.zeros(
+                1,
+                self.hidden_size,
+                dtype=visual_embeds.dtype,
+                device=visual_embeds.device,
+            )
+        if query_context.dim() == 1:
+            query_context = query_context.unsqueeze(0)
+        if query_context.dim() != 2:
+            raise ValueError("query_context should have shape [hidden] or [1, hidden]")
+
         if visual_embeds.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"visual_embeds last dimension should be {self.hidden_size}, "
                 f"got {visual_embeds.shape[-1]}"
             )
 
-        adapted = self.vis_token_adapter(self.vis_token_norm(visual_embeds))
-        gate = self.vis_token_gate.to(
-            device=visual_embeds.device, dtype=visual_embeds.dtype
-        )
-        return visual_embeds + gate * adapted
+        visual_embeds = visual_embeds.unsqueeze(0)
+        query_context = query_context.to(visual_embeds)
+        pooled = self.vis_detail_pooler(visual_embeds, query_context)
+        return pooled[:, 0]
 
     def _prepare_text_tokens(
-        self, hidden_states, inputs_embeds, vis_anchor=None, batch_idx=None
+        self,
+        hidden_states,
+        inputs_embeds,
+        vis_anchor=None,
+        batch_idx=None,
     ):
-        hidden_dim = hidden_states.shape[-1]
-        if hidden_dim == self.num_hidden_levels * self.hidden_size:
-            hidden_context = self._fuse_multilevel_text_tokens(hidden_states)
-            return self._merge_token_and_hidden(
-                inputs_embeds,
-                hidden_context,
-                vis_anchor=vis_anchor,
-                batch_idx=batch_idx,
-            )
-        if hidden_dim == self.hidden_size:
-            return self._merge_token_and_hidden(
-                inputs_embeds,
-                hidden_states,
-                vis_anchor=vis_anchor,
-                batch_idx=batch_idx,
-            )
-        raise ValueError(
-            "hidden_states last dimension should be either "
-            f"{self.num_hidden_levels * self.hidden_size} for multi-level target "
-            f"states or {self.hidden_size} for draft autoregressive states, "
-            f"got {hidden_dim}"
+        hidden_context = self._build_text_context(hidden_states)
+        return self._merge_token_and_hidden(
+            inputs_embeds,
+            hidden_context,
+            vis_anchor=vis_anchor,
+            batch_idx=batch_idx,
         )
 
     def _uniform_visual_selection(self, vis_local_ids, keep_num):
@@ -1194,7 +1298,11 @@ class Model(nn.Module):
         cur_img_msk = image_mask[batch_idx]
         vis_ids = torch.where(cur_img_msk)[0]
         num_vis_tokens = vis_ids.numel()
-        max_budget = min(self.max_total_vis_select_tokens, num_vis_tokens)
+        if self.max_total_vis_select_tokens is not None:
+            max_budget = self.max_total_vis_select_tokens
+        else:
+            max_budget = self.vis_select_tokens
+        max_budget = min(max_budget, num_vis_tokens)
         if num_vis_tokens <= max_budget:
             return cur_img_msk
 
@@ -1404,15 +1512,13 @@ class Model(nn.Module):
                 h_s = []
                 p_i = []
                 a_m = []
-                global_keep_img_msk = None
-                if self.max_total_vis_select_tokens is not None:
-                    global_keep_img_msk = self._select_global_visual_tokens(
-                        image_mask,
-                        text_attn_vis,
-                        vis_attn_scores,
-                        query_token_mask,
-                        b,
-                    )
+                global_keep_img_msk = self._select_global_visual_tokens(
+                    image_mask,
+                    text_attn_vis,
+                    vis_attn_scores,
+                    query_token_mask,
+                    b,
+                )
                 eye_m = torch.eye(
                     seq_length,
                     dtype=hidden_states.dtype,
@@ -1420,68 +1526,83 @@ class Model(nn.Module):
                 )
                 t_m = []
                 self.last_img_hidden = torch.zeros_like(hidden_states[0, :1, ...])
+                self.last_vis_detail = None
+                pool_query = self._build_visual_pool_query(
+                    hidden_states, image_mask, query_token_mask, b
+                )
+                pooled_detail = None
+                detail_pos = None
+                selected_vis_ids = torch.where(global_keep_img_msk)[0]
+                if selected_vis_ids.numel() > 0:
+                    pooled_detail = self._pool_selected_visual_tokens(
+                        inputs_embeds[b, selected_vis_ids], pool_query
+                    )
+                    if pooled_detail is not None:
+                        all_vis_ids = torch.where(image_mask[b])[0]
+                        detail_pos = int(all_vis_ids[-1].item())
+                        self.last_vis_detail = pooled_detail
+
                 for idx in range(num_ids):
                     img_id_end = last_img_ids[b][idx] + 1
                     cur_img_msk = image_mask[b, img_id_start:img_id_end]
-                    if global_keep_img_msk is not None:
-                        keep_img_msk = (
-                            global_keep_img_msk[img_id_start:img_id_end]
-                            & cur_img_msk
+
+                    text_ids = torch.where(~cur_img_msk)[0] + img_id_start
+                    if text_ids.numel() > 0:
+                        h_s.append(
+                            self._prepare_text_tokens(
+                                hidden_states[b, text_ids],
+                                inputs_embeds[b, text_ids],
+                                vis_anchor=vis_anchor,
+                                batch_idx=b,
+                            )
                         )
-                    else:
-                        keep_img_msk = self._select_visual_tokens(
-                            image_mask,
-                            text_attn_vis,
-                            vis_attn_scores,
-                            query_token_mask,
-                            b,
-                            img_id_start,
-                            img_id_end,
-                        )
-                    keep_msk = (~cur_img_msk) | keep_img_msk
-                    keep_ids = torch.where(keep_msk)[0] + img_id_start
-                    cur_hidden = hidden_states[b, keep_ids]
-                    cur_emb = inputs_embeds[b, keep_ids]
-                    cur_is_img = cur_img_msk[keep_msk]
-                    n_cur = keep_ids.shape[0]
-                    cur_out = torch.zeros(
-                        n_cur, self.hidden_size,
-                        dtype=cur_hidden.dtype,
-                        device=cur_hidden.device,
-                    )
-                    # Text tokens: EAGLE-3 multi-level fusion, then vis-anchor token transition.
-                    if (~cur_is_img).any():
-                        cur_out[~cur_is_img] = self._prepare_text_tokens(
-                            cur_hidden[~cur_is_img],
-                            cur_emb[~cur_is_img],
+                        p_i.append(position_ids[b, text_ids])
+                        a_m.append(base_attention_mask[b, text_ids])
+                        t_m.append(eye_m[text_ids, :])
+
+                    if (
+                        pooled_detail is not None
+                        and detail_pos is not None
+                        and img_id_start <= detail_pos < img_id_end
+                    ):
+                        h_s.append(pooled_detail.to(hidden_states))
+                        p_i.append(position_ids[b, detail_pos : detail_pos + 1])
+                        a_m.append(base_attention_mask[b, detail_pos : detail_pos + 1])
+                        t_m.append(eye_m[detail_pos : detail_pos + 1, :])
+
+                    img_id_start = img_id_end
+
+                rst_ids = torch.arange(
+                    img_id_start, seq_length, device=hidden_states.device
+                )
+                if rst_ids.numel() > 0:
+                    h_s.append(
+                        self._prepare_text_tokens(
+                            hidden_states[b, rst_ids],
+                            inputs_embeds[b, rst_ids],
                             vis_anchor=vis_anchor,
                             batch_idx=b,
                         )
-                    # Vision tokens: selected local details adapted to the draft input space.
-                    if cur_is_img.any():
-                        cur_out[cur_is_img] = self._adapt_visual_tokens(
-                            cur_emb[cur_is_img]
-                        )
-
-                    h_s.append(cur_out)
-                    p_i.append(position_ids[b, keep_ids])
-                    a_m.append(base_attention_mask[b, keep_ids])
-                    t_m.append(eye_m[keep_ids, :])
-                    img_id_start = img_id_end
-
-                rst_hidden = hidden_states[b, img_id_start:]
-                rst_emb = inputs_embeds[b, img_id_start:]
-                h_s.append(
-                    self._prepare_text_tokens(
-                        rst_hidden,
-                        rst_emb,
-                        vis_anchor=vis_anchor,
-                        batch_idx=b,
                     )
-                )
-                p_i.append(position_ids[b, img_id_start:])
-                a_m.append(base_attention_mask[b, img_id_start:])
-                t_m.append(eye_m[img_id_start:, :])
+                    p_i.append(position_ids[b, rst_ids])
+                    a_m.append(base_attention_mask[b, rst_ids])
+                    t_m.append(eye_m[rst_ids, :])
+
+                if len(h_s) == 0:
+                    fallback_id = seq_length - 1
+                    fallback_detail = self.last_vis_detail
+                    if fallback_detail is None:
+                        fallback_detail = torch.zeros(
+                            1,
+                            self.hidden_size,
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                    h_s.append(fallback_detail.to(hidden_states))
+                    p_i.append(position_ids[b, fallback_id : fallback_id + 1])
+                    a_m.append(base_attention_mask[b, fallback_id : fallback_id + 1])
+                    t_m.append(eye_m[fallback_id : fallback_id + 1, :])
+
                 h_s = torch.cat(h_s, dim=0).unsqueeze(0)
                 p_i = torch.cat(p_i, dim=0).unsqueeze(0)
                 a_m = torch.cat(a_m, dim=0).unsqueeze(0)
@@ -1505,6 +1626,7 @@ class Model(nn.Module):
         else:
             if past_key_values is None:
                 self.last_img_hidden = torch.zeros_like(hidden_states[0, :1, ...])
+                self.last_vis_detail = None
             hidden_states = self._prepare_text_tokens(
                 hidden_states,
                 inputs_embeds,

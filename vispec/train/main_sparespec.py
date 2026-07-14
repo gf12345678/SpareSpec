@@ -283,6 +283,7 @@ class CustomDataset(Dataset):
                         [query_msk, torch.zeros(pad_len, dtype=query_msk.dtype)]
                     )
                 query_msk = query_msk[:length].to(torch.bool)
+                new_data["query_token_mask"] = query_msk
 
             vis_attn_scores = data.get("vis_attn_scores")
             if vis_attn_scores is not None:
@@ -360,6 +361,11 @@ class DataCollatorWithPadding:
         outtensors[:, :n] = intensors
         return outtensors
 
+    def padding1d(self, intensors, N):
+        outtensors = torch.zeros(N, dtype=intensors.dtype)
+        outtensors[: intensors.shape[0]] = intensors
+        return outtensors
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["hidden_state_big"].shape[1] for item in features)
         batch_inputs_embeds = torch.cat(
@@ -399,8 +405,12 @@ class DataCollatorWithPadding:
             batch["vis_anchor"] = torch.stack([f["vis_anchor"] for f in features])
         if "image_mask" in features[0]:
             batch["image_mask"] = torch.stack(
-                [f["image_mask"] for f in features]
-            )[:, :max_length]
+                [self.padding1d(f["image_mask"], max_length) for f in features]
+            )
+        if "query_token_mask" in features[0]:
+            batch["query_token_mask"] = torch.stack(
+                [self.padding1d(f["query_token_mask"], max_length) for f in features]
+            )
         if "vis_attn_scores" in features[0]:
             batch["vis_attn_scores"] = torch.cat(
                 [self.paddingvector(f["vis_attn_scores"], max_length) for f in features]
@@ -463,6 +473,7 @@ def getkacc(model, data, head, max_length=5):
         image_mask=None,
         text_attn_vis=None,
         vis_attn_scores=None,
+        query_token_mask=None,
         vis_anchor=None,
     ):
         output_ids = []
@@ -489,6 +500,8 @@ def getkacc(model, data, head, max_length=5):
                         model_kwargs["text_attn_vis"] = text_attn_vis
                     if vis_attn_scores is not None:
                         model_kwargs["vis_attn_scores"] = vis_attn_scores
+                    if query_token_mask is not None:
+                        model_kwargs["query_token_mask"] = query_token_mask
                     if vis_anchor is not None:
                         model_kwargs["vis_anchor"] = vis_anchor
                     out_hidden, past_key_values = model(hidden_states, **model_kwargs)
@@ -526,6 +539,9 @@ def getkacc(model, data, head, max_length=5):
         pre_vis_attn_scores = data.get("vis_attn_scores")
         if pre_vis_attn_scores is not None:
             pre_vis_attn_scores = pre_vis_attn_scores[:, :pre_len]
+        pre_query_token_mask = data.get("query_token_mask")
+        if pre_query_token_mask is not None:
+            pre_query_token_mask = pre_query_token_mask[:, :pre_len]
         outs = generate(
             pre_hidden_states,
             pre_inputs_embeds,
@@ -534,6 +550,7 @@ def getkacc(model, data, head, max_length=5):
             image_mask=pre_image_mask,
             text_attn_vis=pre_text_attn_vis,
             vis_attn_scores=pre_vis_attn_scores,
+            query_token_mask=pre_query_token_mask,
             vis_anchor=data.get("vis_anchor"),
         )
         generate_ids = outs
@@ -694,6 +711,7 @@ for epoch in range(args.begin_epoch, num_epochs):
                 model_kwargs["vis_anchor"] = data.get("vis_anchor")
                 model_kwargs["text_attn_vis"] = data.get("text_attn_vis")
                 model_kwargs["vis_attn_scores"] = data.get("vis_attn_scores")
+                model_kwargs["query_token_mask"] = data.get("query_token_mask")
 
             predict = model(data["hidden_states"], **model_kwargs)
             with torch.no_grad():
@@ -811,6 +829,7 @@ for epoch in range(args.begin_epoch, num_epochs):
                 model_kwargs_val["vis_anchor"] = data.get("vis_anchor")
                 model_kwargs_val["text_attn_vis"] = data.get("text_attn_vis")
                 model_kwargs_val["vis_attn_scores"] = data.get("vis_attn_scores")
+                model_kwargs_val["query_token_mask"] = data.get("query_token_mask")
 
             predict = model(data["hidden_states"], **model_kwargs_val)
             target_head = head(data["target"])
