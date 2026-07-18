@@ -112,16 +112,16 @@ if accelerator.is_main_process:
         wandb.init(
             project="sparespec", entity="yuhui-li", mode="offline", config=train_config
         )
-    except ImportError:
-        print("[SpareSpec] wandb is not installed; logging to wandb is disabled.")
+    except Exception as exc:
+        print(f"[SpareSpec] wandb is unavailable; logging to wandb is disabled: {exc}")
         wandb = _NoOpWandb()
 
     try:
         from torch.utils.tensorboard import SummaryWriter
 
         writer = SummaryWriter(log_dir=f"{args.cpdir}/run")
-    except ImportError:
-        print("[SpareSpec] tensorboard is not installed; tensorboard logging is disabled.")
+    except Exception as exc:
+        print(f"[SpareSpec] tensorboard is unavailable; tensorboard logging is disabled: {exc}")
         writer = _NoOpWriter()
 
 try:
