@@ -42,8 +42,8 @@ mtp_loss_weight="0.5"
 bs="1"
 grad_accum="1"
 num_workers="2"
-max_len="3200"
-num_epochs="20"
+max_len="4096"
+num_epochs="21"
 max_train_steps="0"
 max_val_batches="0"
 kacc_batches="10"
@@ -94,8 +94,8 @@ Stage1 train:
   --bs N                       Default: 1
   --gradient-accumulation-steps N  Default: 1
   --num-workers N              Default: 2
-  --max-len N                  Default: 3200
-  --num-epochs N               Default: 20
+  --max-len N                  Default: 4096
+  --num-epochs N               Default: 21
   --max-train-steps N          Debug cap. 0 means full epoch.
   --max-val-batches N          Debug cap. 0 means full validation.
   --kacc-batches N             Validation k-step accuracy batches. 0 disables.

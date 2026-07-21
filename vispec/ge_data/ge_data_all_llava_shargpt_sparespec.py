@@ -75,18 +75,40 @@ def build_dataset_rank(
 
     def preprocess_function(examples):
         new_examples = {"conversation": [], "input_ids": [], "loss_mask": []}
-        for i in range(len(examples["id"])):
+        for row_idx in range(len(examples["id"])):
             conv = get_conversation_template("vicuna")
             roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-            source = examples["conversations"][i]
-            if roles[source[0]["from"]] != conv.roles[0]:
+            source = examples["conversations"][row_idx]
+            if not source:
+                continue
+
+            first_message = source[0]
+            first_role = (
+                roles.get(first_message.get("from"))
+                if isinstance(first_message, dict)
+                else None
+            )
+            if first_role != conv.roles[0]:
                 # Skip the first one if it is not from human
                 source = source[1:]
+            if not source:
+                continue
+
             conv.messages = []
+            valid = True
             for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
-                assert role == conv.roles[j % 2], f"{i}"
-                conv.append_message(role, sentence["value"])
+                if not isinstance(sentence, dict):
+                    valid = False
+                    break
+                role = roles.get(sentence.get("from"))
+                value = sentence.get("value")
+                if role is None or value is None or role != conv.roles[j % 2]:
+                    valid = False
+                    break
+                conv.append_message(role, value)
+            if not valid or not conv.messages:
+                continue
+
             conversation = conv.get_prompt()
             # if i==56:
             #     print(i)
@@ -134,6 +156,9 @@ def build_dataset_rank(
 
             loss_mask[cur_len:] = 0
 
+            if input_ids.numel() == 0 or loss_mask.sum().item() == 0:
+                continue
+
             new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
@@ -164,8 +189,8 @@ bigmodel.eval()
 with torch.no_grad():
     dummy = bigmodel(torch.tensor([[0]]).cuda(), output_hidden_states=True)
     n_layers = len(dummy.hidden_states) - 1
-shallow_idx = max(1, n_layers / 4 + 1)
-middle_idx = n_layers / 2 + 1
+shallow_idx = max(1, n_layers // 4 + 1)
+middle_idx = n_layers // 2 + 1
 deep_idx = -1
 print(f"[SpareSpec Stage1] Model: {bigname}, n_layers={n_layers}")
 print(f"  shallow_idx={shallow_idx}, middle_idx={middle_idx}, deep_idx={deep_idx}")

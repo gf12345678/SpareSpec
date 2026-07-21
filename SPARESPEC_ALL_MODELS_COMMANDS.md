@@ -65,8 +65,8 @@ vispec_data/llava-v1.6-vicuna-7b-hf/sparespec_data/llava_v1.6_shargpt_sparespec_
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ### Stage 2 数据生成
@@ -90,7 +90,7 @@ vispec_data/llava-v1.6-vicuna-7b-hf/sparespec_data/llava_v1.6_shargpt_sparespec_
 ### Stage 2 训练
 
 ```bash
-STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-7b-hf/checkpoints/stage1/state_19/model.safetensors
+STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-7b-hf/checkpoints/stage1/state_20/model.safetensors
 
 ./train_sparespec.sh \
   --mode stage2-train \
@@ -103,8 +103,8 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-7b-hf/checkpoints/stage1/state_19/mode
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ## 2. LLaVA-v1.6 Vicuna 13B
@@ -136,8 +136,8 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-7b-hf/checkpoints/stage1/state_19/mode
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ### Stage 2 数据生成
@@ -161,7 +161,7 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-7b-hf/checkpoints/stage1/state_19/mode
 ### Stage 2 训练
 
 ```bash
-STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-13b-hf/checkpoints/stage1/state_19/model.safetensors
+STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-13b-hf/checkpoints/stage1/state_20/model.safetensors
 
 ./train_sparespec.sh \
   --mode stage2-train \
@@ -174,8 +174,8 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-13b-hf/checkpoints/stage1/state_19/mod
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ## 3. Qwen2.5-VL 3B Instruct
@@ -207,8 +207,8 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-13b-hf/checkpoints/stage1/state_19/mod
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ### Stage 2 数据生成
@@ -232,7 +232,7 @@ STAGE1_CKPT=vispec_data/llava-v1.6-vicuna-13b-hf/checkpoints/stage1/state_19/mod
 ### Stage 2 训练
 
 ```bash
-STAGE1_CKPT=vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage1/state_19/model.safetensors
+STAGE1_CKPT=vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage1/state_20/model.safetensors
 
 ./train_sparespec.sh \
   --mode stage2-train \
@@ -245,8 +245,8 @@ STAGE1_CKPT=vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage1/state_19/model
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ## 4. Qwen2.5-VL 7B Instruct
@@ -278,8 +278,8 @@ STAGE1_CKPT=vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage1/state_19/model
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ### Stage 2 数据生成
@@ -303,7 +303,7 @@ STAGE1_CKPT=vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage1/state_19/model
 ### Stage 2 训练
 
 ```bash
-STAGE1_CKPT=vispec_data/Qwen2.5-VL-7B-Instruct/checkpoints/stage1/state_19/model.safetensors
+STAGE1_CKPT=vispec_data/Qwen2.5-VL-7B-Instruct/checkpoints/stage1/state_20/model.safetensors
 
 ./train_sparespec.sh \
   --mode stage2-train \
@@ -316,8 +316,8 @@ STAGE1_CKPT=vispec_data/Qwen2.5-VL-7B-Instruct/checkpoints/stage1/state_19/model
   --bs 1 \
   --gradient-accumulation-steps 1 \
   --num-workers 8 \
-  --num-epochs 20 \
-  --max-len 2048
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 ## 5. Checkpoint 与断点续训
