@@ -1,4 +1,5 @@
 import argparse
+import math
 
 parser = argparse.ArgumentParser(description="SpareSpec Training")
 parser.add_argument("--basepath", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
@@ -9,7 +10,13 @@ parser.add_argument("--bs", type=int, default=4)
 parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
 parser.add_argument("--tmpdir", type=str, default="0")
 parser.add_argument("--cpdir", type=str, default="0")
-parser.add_argument("--pw", type=float, default=0.1)
+parser.add_argument("--pw", type=float, default=0.1, help="Deprecated alias")
+parser.add_argument("--hidden-loss-weight", type=float, default=1.0)
+parser.add_argument("--kd-loss-weight", type=float, default=0.1)
+parser.add_argument("--ranking-loss-weight", type=float, default=0.01)
+parser.add_argument("--ranking-topk", type=int, default=10)
+parser.add_argument("--mtp-steps", type=int, default=None)
+parser.add_argument("--mtp-loss-weight", type=float, default=0.5)
 parser.add_argument("--num-workers", type=int, default=2)
 parser.add_argument("--max-len", type=int, default=3200)
 parser.add_argument("--num-hidden-levels", type=int, default=3)
@@ -25,6 +32,12 @@ parser.add_argument("--max-train-steps", type=int, default=0)
 parser.add_argument("--max-val-batches", type=int, default=0)
 parser.add_argument("--kacc-batches", type=int, default=10)
 args = parser.parse_args()
+if args.mtp_steps is None:
+    args.mtp_steps = 1 if args.stage == 2 else 0
+if args.stage == 1 and args.mtp_steps != 0:
+    raise ValueError("SpareSpec stage 1 requires --mtp-steps 0")
+if args.stage == 2 and args.mtp_steps not in (0, 1):
+    raise ValueError("SpareSpec stage 2 currently supports --mtp-steps 0 or 1")
 if args.stage == 2 and args.bs != 1:
     print("[SpareSpec] stage 2 currently supports batch size 1; overriding --bs to 1.")
     args.bs = 1
@@ -36,9 +49,12 @@ train_config = {
     "datapath": f"{args.tmpdir}",
     "is_warmup": True,
     "num_epochs": args.num_epochs,
-    "p_w": args.pw,
-    "v_w": 1.0,
-    "head_w": 0.1,
+    "p_w": args.kd_loss_weight,
+    "v_w": args.hidden_loss_weight,
+    "ranking_w": args.ranking_loss_weight,
+    "ranking_topk": args.ranking_topk,
+    "mtp_steps": args.mtp_steps,
+    "mtp_w": args.mtp_loss_weight,
     "num_workers": args.num_workers,
     "embeding": True,
     "act": "No",
@@ -343,6 +359,13 @@ class CustomDataset(Dataset):
 
 class DataCollatorWithPadding:
 
+    @staticmethod
+    def has_consistent_field(features, name):
+        present = [name in feature and feature[name] is not None for feature in features]
+        if any(present) and not all(present):
+            raise ValueError(f"Inconsistent optional field '{name}' within one batch")
+        return all(present)
+
     def paddingtensor(self, intensors, N):
         B, n, S = intensors.shape
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype)
@@ -401,21 +424,21 @@ class DataCollatorWithPadding:
             "loss_mask": batch_loss_mask,
         }
         # Stage 2: pass vis_anchor and image_mask through
-        if "vis_anchor" in features[0]:
+        if self.has_consistent_field(features, "vis_anchor"):
             batch["vis_anchor"] = torch.stack([f["vis_anchor"] for f in features])
-        if "image_mask" in features[0]:
+        if self.has_consistent_field(features, "image_mask"):
             batch["image_mask"] = torch.stack(
                 [self.padding1d(f["image_mask"], max_length) for f in features]
             )
-        if "query_token_mask" in features[0]:
+        if self.has_consistent_field(features, "query_token_mask"):
             batch["query_token_mask"] = torch.stack(
                 [self.padding1d(f["query_token_mask"], max_length) for f in features]
             )
-        if "vis_attn_scores" in features[0]:
+        if self.has_consistent_field(features, "vis_attn_scores"):
             batch["vis_attn_scores"] = torch.cat(
                 [self.paddingvector(f["vis_attn_scores"], max_length) for f in features]
             )
-        if "text_attn_vis" in features[0]:
+        if self.has_consistent_field(features, "text_attn_vis"):
             batch["text_attn_vis"] = torch.cat(
                 [self.paddingattention(f["text_attn_vis"], max_length) for f in features]
             )
@@ -439,27 +462,76 @@ def top_accuracy(output, target, topk=(1,)):
         return res
 
 
-def compute_loss(target, target_p, predict, loss_mask):
-    loss_mask = loss_mask.to(bool)
-    out_head = head(predict)
-    out_logp = nn.LogSoftmax(dim=-1)(out_head[loss_mask[..., 0]])
-    if out_logp.numel() == 0:
-        return out_logp.sum(), out_logp.sum(), out_head
-    target_p = target_p[loss_mask[..., 0]]
-    plogp = target_p * out_logp
-    ploss = -torch.mean(plogp.sum(-1))
-    vloss = criterion(predict[loss_mask[..., 0]], target[loss_mask[..., 0]])
-    vloss = torch.mean(vloss.mean(-1))
+def compute_loss(target, predict, loss_mask):
+    """Compute losses only at supervised positions to avoid full-sequence vocab logits."""
+    valid_mask = loss_mask.to(dtype=torch.bool)
+    if valid_mask.dim() == 3:
+        valid_mask = valid_mask[..., 0]
 
-    _, topk_indices = torch.topk(target_p, k=10, dim=-1)
-    student_topk_logits = out_head[loss_mask[..., 0]].gather(-1, topk_indices)
-    reversed_logits = torch.flip(student_topk_logits, dims=[-1])
-    log_cumsum_exp = torch.logcumsumexp(reversed_logits, dim=-1)
-    log_denominator = torch.flip(log_cumsum_exp, dims=[-1])
-    log_likelihood = student_topk_logits - log_denominator
-    rloss = -torch.mean(log_likelihood.sum(-1))
+    valid_target = target[valid_mask]
+    valid_predict = predict[valid_mask]
+    if valid_predict.numel() == 0:
+        zero = predict.sum() * 0.0
+        empty = predict.new_empty((0, head.weight.shape[0]))
+        return zero, zero, zero, zero, empty, empty
 
-    return vloss, ploss + 0.1 * rloss, out_head
+    vloss = criterion(valid_predict, valid_target).mean()
+    student_logits = head(valid_predict)
+    with torch.no_grad():
+        teacher_logits = head(valid_target)
+        teacher_p = torch.softmax(teacher_logits, dim=-1)
+
+    student_logp = torch.log_softmax(student_logits, dim=-1)
+    ploss = -(teacher_p * student_logp).sum(dim=-1).mean()
+
+    topk = min(train_config["ranking_topk"], teacher_p.shape[-1])
+    if train_config["ranking_w"] > 0 and topk > 1:
+        topk_indices = torch.topk(teacher_p, k=topk, dim=-1).indices
+        ranked_logits = student_logits.gather(-1, topk_indices)
+        reversed_logits = torch.flip(ranked_logits, dims=[-1])
+        log_denominator = torch.flip(
+            torch.logcumsumexp(reversed_logits, dim=-1), dims=[-1]
+        )
+        rloss = -(ranked_logits - log_denominator).sum(dim=-1).mean()
+    else:
+        rloss = student_logits.sum() * 0.0
+
+    loss = (
+        train_config["v_w"] * vloss
+        + train_config["p_w"] * ploss
+        + train_config["ranking_w"] * rloss
+    )
+    return loss, vloss, ploss, rloss, student_logits, teacher_logits
+
+
+def build_rollout_hidden(hidden_states, predict):
+    """Shift draft states by one position for one-step training-time rollout."""
+    hidden_size = predict.shape[-1]
+    seed_hidden = hidden_states[:, :1, -hidden_size:]
+    return torch.cat((seed_hidden, predict[:, :-1]), dim=1)
+
+
+def forward_with_training_loss(model, data, model_kwargs):
+    loss_mask = data["loss_mask"][:, :, None]
+    predict0 = model(data["hidden_states"], **model_kwargs)
+    step0 = compute_loss(data["target"], predict0, loss_mask)
+    total_loss = step0[0]
+    step1 = None
+
+    if args.stage == 2 and train_config["mtp_steps"] == 1:
+        rollout_hidden = build_rollout_hidden(data["hidden_states"], predict0)
+        predict1 = model(rollout_hidden, **model_kwargs)
+        step1 = compute_loss(data["target"], predict1, loss_mask)
+        total_loss = total_loss + train_config["mtp_w"] * step1[0]
+
+    return total_loss, step0, step1
+
+
+def module_grad_norm(module):
+    norms = [p.grad.detach().float().norm(2) for p in module.parameters() if p.grad is not None]
+    if not norms:
+        return 0.0
+    return torch.stack(norms).norm(2).item()
 
 
 @torch.no_grad()
@@ -611,6 +683,7 @@ test_loader = DataLoader(
     pin_memory=True,
 )
 
+resume_state_dir = None
 if not os.path.exists(args.cpdir):
     if accelerator.is_main_process:
         os.makedirs(args.cpdir)
@@ -620,13 +693,11 @@ else:
         begin_epoch = max(
             int(c.split("_")[1]) + 1 if c.startswith("state") else 0 for c in ckpts
         )
-        loadpath = os.path.join(
-            args.cpdir, f"state_{begin_epoch - 1}", "model.safetensors"
-        )
-        if os.path.exists(loadpath):
-            print(f"resume from {loadpath}")
-            args.loadpath = loadpath
+        candidate_state_dir = os.path.join(args.cpdir, f"state_{begin_epoch - 1}")
+        if os.path.exists(os.path.join(candidate_state_dir, "model.safetensors")):
+            resume_state_dir = candidate_state_dir
             args.begin_epoch = begin_epoch
+            print(f"resume full training state from {resume_state_dir}")
 
 
 config = EConfig.from_pretrained(train_config["config_path"])
@@ -642,7 +713,7 @@ model = Model(
     max_total_vis_select_tokens=args.max_total_vis_select_tokens,
 )
 
-if args.loadpath:
+if args.loadpath and resume_state_dir is None:
     with open(args.loadpath, "rb") as f:
         from safetensors.torch import load
 
@@ -662,8 +733,11 @@ optimizer = optim.AdamW(
 )
 
 num_epochs = train_config["num_epochs"]
-num_warmup_steps = max(len(train_loader) * 1, 1)
-total_steps = max(len(train_loader) * num_epochs, 1)
+updates_per_epoch = max(
+    math.ceil(len(train_loader) / train_config["gradient_accumulation_steps"]), 1
+)
+num_warmup_steps = updates_per_epoch
+total_steps = max(updates_per_epoch * num_epochs, 1)
 is_warmup = train_config["is_warmup"]
 
 if is_warmup:
@@ -679,8 +753,10 @@ else:
         model, head, optimizer, train_loader, test_loader
     )
 
-if is_warmup:
-    for i in range(args.begin_epoch * len(train_loader)):
+if resume_state_dir is not None:
+    accelerator.load_state(resume_state_dir)
+elif is_warmup and args.begin_epoch > 0:
+    for _ in range(args.begin_epoch * updates_per_epoch):
         scheduler.step()
 
 global_train_steps = 0
@@ -713,17 +789,17 @@ for epoch in range(args.begin_epoch, num_epochs):
                 model_kwargs["vis_attn_scores"] = data.get("vis_attn_scores")
                 model_kwargs["query_token_mask"] = data.get("query_token_mask")
 
-            predict = model(data["hidden_states"], **model_kwargs)
-            with torch.no_grad():
-                target_head = head(data["target"])
-                target_p = nn.Softmax(dim=2)(target_head)
-                target_p = target_p.detach()
-            loss_mask = data["loss_mask"][:, :, None]
-            vloss, ploss, out_head = compute_loss(
-                data["target"], target_p, predict, loss_mask
+            loss, step0, step1 = forward_with_training_loss(
+                model, data, model_kwargs
             )
-            loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss
+            vloss, ploss, rloss = step0[1:4]
+            out_head, target_head = step0[4:6]
             accelerator.backward(loss)
+            pooler_grad_norm = 0.0
+            if args.stage == 2:
+                pooler_grad_norm = module_grad_norm(
+                    accelerator.unwrap_model(model).vis_detail_pooler
+                )
             if accelerator.sync_gradients:
                 accelerator.clip_grad_value_(
                     model.parameters(), train_config["grad_clip"]
@@ -733,12 +809,10 @@ for epoch in range(args.begin_epoch, num_epochs):
                 scheduler.step()
 
         with torch.no_grad():
-            _, predicted = torch.max(out_head, 2)
-            _, target = torch.max(target_head, 2)
-            ct = loss_mask.sum().item()
-            cc = ((predicted == target) * loss_mask.squeeze()).sum().item()
-            out_head = out_head.view(-1, target_head.shape[-1])[loss_mask.view(-1) == 1]
-            target = target.view(-1)[loss_mask.view(-1) == 1]
+            target = torch.argmax(target_head, dim=-1)
+            predicted = torch.argmax(out_head, dim=-1)
+            ct = target.numel()
+            cc = (predicted == target).sum().item()
             topkacc = top_accuracy(out_head, target, (1, 2, 3))
             for top_i in range(len(topkacc)):
                 top_3acc[top_i] += topkacc[top_i]
@@ -748,10 +822,23 @@ for epoch in range(args.begin_epoch, num_epochs):
             logdict = {
                 "train/lr": optimizer.optimizer.param_groups[0]["lr"],
                 "train/vloss": vloss.item(),
-                "train/ploss": ploss.item(),
+                "train/ploss_step0": ploss.item(),
+                "train/rloss_step0": rloss.item(),
                 "train/loss": loss.item(),
-                "train/acc": cc / ct,
+                "train/acc_step0": cc / ct,
+                "train/vis_detail_pooler_grad_norm": pooler_grad_norm,
             }
+            if step1 is not None:
+                logdict.update({
+                    "train/vloss_step1": step1[1].item(),
+                    "train/ploss_step1": step1[2].item(),
+                    "train/rloss_step1": step1[3].item(),
+                })
+                step1_target = torch.argmax(step1[5], dim=-1)
+                step1_pred = torch.argmax(step1[4], dim=-1)
+                logdict["train/acc_step1"] = (
+                    (step1_pred == step1_target).float().mean().item()
+                )
             for id, i in enumerate(top_3acc):
                 logdict[f"train/top_{id + 1}_acc"] = topkacc[id].item() / ct
             wandb.log(logdict)
@@ -831,23 +918,15 @@ for epoch in range(args.begin_epoch, num_epochs):
                 model_kwargs_val["vis_attn_scores"] = data.get("vis_attn_scores")
                 model_kwargs_val["query_token_mask"] = data.get("query_token_mask")
 
-            predict = model(data["hidden_states"], **model_kwargs_val)
-            target_head = head(data["target"])
-            target_p = nn.Softmax(dim=2)(target_head)
-            target_p = target_p.detach()
-            loss_mask = data["loss_mask"][:, :, None]
-            vloss, ploss, out_head = compute_loss(
-                data["target"], target_p, predict, loss_mask
+            loss, step0, step1 = forward_with_training_loss(
+                model, data, model_kwargs_val
             )
-            loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss
-            _, predicted = torch.max(out_head, 2)
-            _, target = torch.max(target_head, 2)
-            ct = loss_mask.sum().item()
-            cc = ((predicted == target) * loss_mask.squeeze()).sum().item()
-            out_head = out_head.view(-1, target_head.shape[-1])[
-                loss_mask.reshape(-1) == 1
-            ]
-            target = target.reshape(-1)[loss_mask.reshape(-1) == 1]
+            vloss, ploss, rloss = step0[1:4]
+            out_head, target_head = step0[4:6]
+            target = torch.argmax(target_head, dim=-1)
+            predicted = torch.argmax(out_head, dim=-1)
+            ct = target.numel()
+            cc = (predicted == target).sum().item()
             topkacc = top_accuracy(out_head, target, (1, 2, 3))
             for top_i in range(len(topkacc)):
                 top_3acc[top_i] += topkacc[top_i]

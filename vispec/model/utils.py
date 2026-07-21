@@ -317,38 +317,30 @@ def initialize_tree(
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     # Clone the output hidden states
 
-    try:
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
-            model.spec_layer.topK_genrate(
-                hidden_states,
-                input_ids,
-                model.base_model.lm_head,
-                logits_processor,
-                inputs_embeds=inputs_embeds,
-                # embed_weights=embed_weights,
-                image_mask=image_mask,
-                text_attn_vis=text_attn_vis,
-                vis_attn_scores=vis_attn_scores,
-                query_token_mask=query_token_mask,
-                vis_anchor=vis_anchor,
-            )
+    base_model = model.base_model
+    if hasattr(base_model, "lm_head"):
+        lm_head = base_model.lm_head
+    elif hasattr(base_model, "language_model") and hasattr(
+        base_model.language_model, "lm_head"
+    ):
+        lm_head = base_model.language_model.lm_head
+    else:
+        raise AttributeError("Unable to locate lm_head on the base multimodal model")
+
+    draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
+        model.spec_layer.topK_genrate(
+            hidden_states,
+            input_ids,
+            lm_head,
+            logits_processor,
+            inputs_embeds=inputs_embeds,
+            image_mask=image_mask,
+            text_attn_vis=text_attn_vis,
+            vis_attn_scores=vis_attn_scores,
+            query_token_mask=query_token_mask,
+            vis_anchor=vis_anchor,
         )
-    except:
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids = (
-            model.spec_layer.topK_genrate(
-                hidden_states,
-                input_ids,
-                model.base_model.language_model.lm_head,
-                logits_processor,
-                inputs_embeds=inputs_embeds,
-                # embed_weights=embed_weights,
-                image_mask=image_mask,
-                text_attn_vis=text_attn_vis,
-                vis_attn_scores=vis_attn_scores,
-                query_token_mask=query_token_mask,
-                vis_anchor=vis_anchor,
-            )
-        )
+    )
     return (
         draft_tokens,
         retrieve_indices,

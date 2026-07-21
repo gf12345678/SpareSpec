@@ -33,6 +33,12 @@ temperature="0"
 save_attentions="true"
 
 lr="3e-5"
+lr_explicit="false"
+hidden_loss_weight="1.0"
+kd_loss_weight="0.1"
+ranking_loss_weight="0.01"
+ranking_topk="10"
+mtp_loss_weight="0.5"
 bs="1"
 grad_accum="1"
 num_workers="2"
@@ -79,7 +85,12 @@ Stage1 data:
 Stage1 train:
   --stage1-data PATH           Generated stage1 data directory. Required.
   --cpdir PATH                 Checkpoint output directory. Required.
-  --lr FLOAT                   Default: 3e-5
+  --lr FLOAT                   Default: stage1 3e-5; stage2 3e-6
+  --hidden-loss-weight FLOAT   Hidden-state SmoothL1 weight. Default: 1.0
+  --kd-loss-weight FLOAT       Soft-target distillation weight. Default: 0.1
+  --ranking-loss-weight FLOAT  Top-k ranking weight. Default: 0.01
+  --ranking-topk N             Ranking candidate count. Default: 10
+  --mtp-loss-weight FLOAT      Stage2 second-step loss weight. Default: 0.5
   --bs N                       Default: 1
   --gradient-accumulation-steps N  Default: 1
   --num-workers N              Default: 2
@@ -179,7 +190,12 @@ while [[ $# -gt 0 ]]; do
     --temperature) require_value "$1" "${2:-}"; temperature="$2"; shift 2 ;;
     --save-attentions) require_value "$1" "${2:-}"; save_attentions="$2"; shift 2 ;;
 
-    --lr) require_value "$1" "${2:-}"; lr="$2"; shift 2 ;;
+    --lr) require_value "$1" "${2:-}"; lr="$2"; lr_explicit="true"; shift 2 ;;
+    --hidden-loss-weight) require_value "$1" "${2:-}"; hidden_loss_weight="$2"; shift 2 ;;
+    --kd-loss-weight) require_value "$1" "${2:-}"; kd_loss_weight="$2"; shift 2 ;;
+    --ranking-loss-weight) require_value "$1" "${2:-}"; ranking_loss_weight="$2"; shift 2 ;;
+    --ranking-topk) require_value "$1" "${2:-}"; ranking_topk="$2"; shift 2 ;;
+    --mtp-loss-weight) require_value "$1" "${2:-}"; mtp_loss_weight="$2"; shift 2 ;;
     --bs) require_value "$1" "${2:-}"; bs="$2"; shift 2 ;;
     --gradient-accumulation-steps) require_value "$1" "${2:-}"; grad_accum="$2"; shift 2 ;;
     --num-workers) require_value "$1" "${2:-}"; num_workers="$2"; shift 2 ;;
@@ -211,6 +227,10 @@ if [[ -n "$legacy_data_path" ]]; then
   esac
 fi
 
+if [[ "$mode" == "stage2-train" && "$lr_explicit" == "false" ]]; then
+  lr="3e-6"
+fi
+
 export CUDA_VISIBLE_DEVICES="$cuda_devices"
 
 # ---------------------------------------------------------------------------
@@ -218,8 +238,12 @@ export CUDA_VISIBLE_DEVICES="$cuda_devices"
 # ---------------------------------------------------------------------------
 
 run_stage1_data() {
+  local allocation_module="vispec.ge_data.allocation_qwen_shargpt_sparespec"
+  if [[ "${base_model,,}" == *llava* ]]; then
+    allocation_module="vispec.ge_data.allocation_llava_shargpt_sparespec"
+  fi
   local cmd=(
-    python -m vispec.ge_data.allocation_qwen_shargpt_sparespec
+    python -m "$allocation_module"
     --start "$start"
     --end "$end"
     --outdir "$outdir"
@@ -231,8 +255,12 @@ run_stage1_data() {
 }
 
 run_stage2_data() {
+  local allocation_module="vispec.ge_data.allocation_qwen_pretrain_gen_sparespec"
+  if [[ "${base_model,,}" == *llava* ]]; then
+    allocation_module="vispec.ge_data.allocation_llava_pretrain_gen_sparespec"
+  fi
   local cmd=(
-    python -m vispec.ge_data.allocation_qwen_pretrain_gen_sparespec
+    python -m "$allocation_module"
     --start "$start"
     --end "$end"
     --outdir "$outdir"
@@ -258,11 +286,17 @@ run_stage1_train() {
   local cmd=(
     python -m vispec.train.main_sparespec
     --stage 1
+    --mtp-steps 0
     --tmpdir "$stage1_data"
     --cpdir "$cpdir"
     --basepath "$base_model"
     --configpath "$configpath"
     --lr "$lr"
+    --hidden-loss-weight "$hidden_loss_weight"
+    --kd-loss-weight "$kd_loss_weight"
+    --ranking-loss-weight "$ranking_loss_weight"
+    --ranking-topk "$ranking_topk"
+    --mtp-loss-weight "$mtp_loss_weight"
     --bs "$bs"
     --gradient-accumulation-steps "$grad_accum"
     --num-workers "$num_workers"
@@ -283,11 +317,17 @@ run_stage2_train() {
   local cmd=(
     python -m vispec.train.main_sparespec
     --stage 2
+    --mtp-steps 1
     --tmpdir "$stage2_data"
     --cpdir "$cpdir"
     --basepath "$base_model"
     --configpath "$configpath"
     --lr "$lr"
+    --hidden-loss-weight "$hidden_loss_weight"
+    --kd-loss-weight "$kd_loss_weight"
+    --ranking-loss-weight "$ranking_loss_weight"
+    --ranking-topk "$ranking_topk"
+    --mtp-loss-weight "$mtp_loss_weight"
     --bs "$bs"
     --gradient-accumulation-steps "$grad_accum"
     --num-workers "$num_workers"
