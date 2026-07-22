@@ -55,8 +55,8 @@ Stage1 只训练 EAGLE3 风格 text token 路径：
   --configpath vispec/train/qwen2.5_vl_3B_sparespec_config.json \
   --bs 4 \
   --gradient-accumulation-steps 1 \
-  --num-epochs 20 \
-  --max-len 3200
+  --num-epochs 21 \
+  --max-len 4096
 ```
 
 Stage1 产出的 checkpoint 用于初始化 Stage2：
@@ -111,11 +111,11 @@ Stage2 训练完整 SpareSpec：text token 路径、global `vis_anchor`、select
   --stage2-data vispec_data/sparespec_data/qwen2.5vl_pretrain_sparespec_0_67999_mubf16 \
   --cpdir vispec_data/checkpoints/sparespec_stage2 \
   --configpath vispec/train/qwen2.5_vl_3B_sparespec_config.json \
-  --loadpath vispec_data/checkpoints/sparespec_stage1/state_19/model.safetensors \
+  --loadpath vispec_data/checkpoints/sparespec_stage1/state_20/model.safetensors \
   --bs 1 \
   --gradient-accumulation-steps 4 \
-  --num-epochs 20 \
-  --max-len 3200 \
+  --num-epochs 21 \
+  --max-len 4096 \
   --vis-select-tokens 64 \
   --min-vis-select-tokens 16 \
   --vis-entropy-alpha 1.2 \

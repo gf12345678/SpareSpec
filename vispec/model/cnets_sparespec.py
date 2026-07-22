@@ -833,7 +833,12 @@ class Model(nn.Module):
         if self.img_fc.bias is not None:
             nn.init.zeros_(self.img_fc.bias)
 
-        # Kept for checkpoint compatibility; direct visual selection does not use them.
+        # Kept for checkpoint compatibility; the current forward path uses
+        # anchor_fc instead of fc and direct visual selection does not use
+        # imadpt/img_fc. Freezing these parameters also keeps DDP from waiting
+        # for gradients that cannot be produced by the active architecture.
+        for param in self.fc.parameters():
+            param.requires_grad = False
         for param in self.imadpt.parameters():
             param.requires_grad = False
         for param in self.img_fc.parameters():
