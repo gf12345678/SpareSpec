@@ -713,6 +713,14 @@ model = Model(
     max_total_vis_select_tokens=args.max_total_vis_select_tokens,
 )
 
+# Stage 1 is text-only, so the visual detail pooler cannot participate in its
+# computation graph. Keep it frozen for text pretraining; a Stage 2 process
+# constructs a fresh model with this module trainable and loads the Stage 1
+# checkpoint before multimodal optimization.
+if args.stage == 1:
+    for param in model.vis_detail_pooler.parameters():
+        param.requires_grad = False
+
 if args.loadpath and resume_state_dir is None:
     with open(args.loadpath, "rb") as f:
         from safetensors.torch import load
