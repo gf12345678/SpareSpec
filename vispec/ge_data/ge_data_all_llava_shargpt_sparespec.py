@@ -235,8 +235,10 @@ def writedata(name, data_point, idx):
         torch.save(data_point, tmp_path)
         os.replace(tmp_path, final_path)
     finally:
-        if os.path.exists(tmp_path):
+        try:
             os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 for i, data in enumerate(tqdm(ds)):
