@@ -30,9 +30,32 @@ import torch.nn.functional as F
 from datasets import Dataset, load_dataset
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 bigname = args.model
+
+LLAVA_VICUNA_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] != 'system' %}"
+    "{{ message['role'].upper() + ': '}}"
+    "{% endif %}"
+    "{# Render all images first #}"
+    "{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}"
+    "{{ '<image>\n' }}"
+    "{% endfor %}"
+    "{# Render all text next #}"
+    "{% if message['role'] != 'assistant' %}"
+    "{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}"
+    "{{ content['text'] + ' '}}"
+    "{% endfor %}"
+    "{% else %}"
+    "{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}"
+    "{% generation %}{{ content['text'] + ' '}}{% endgeneration %}"
+    "{% endfor %}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ 'ASSISTANT:' }}{% endif %}"
+)
 
 
 def build_dataset_rank(processor, path):
@@ -70,7 +93,9 @@ def build_dataset_rank(processor, path):
                 pass
             else:
                 raise ValueError("Unknown role")
-        prompt_input = processor.apply_chat_template(conversation, add_generation_prompt=True)
+        prompt_input = processor.apply_chat_template(
+            conversation, add_generation_prompt=True
+        )
         image_file = os.path.join(path, examples["image"])
         if not os.path.exists(image_file):
             image_file = os.path.join(path, "images", examples["image"])
@@ -89,6 +114,15 @@ def build_dataset_rank(processor, path):
 
 
 processor = AutoProcessor.from_pretrained(bigname, use_fast=True)
+model_config = AutoConfig.from_pretrained(bigname)
+if not getattr(processor, "chat_template", None):
+    processor.chat_template = LLAVA_VICUNA_CHAT_TEMPLATE
+if getattr(processor, "patch_size", None) is None:
+    processor.patch_size = model_config.vision_config.patch_size
+if getattr(processor, "vision_feature_select_strategy", None) is None:
+    processor.vision_feature_select_strategy = (
+        model_config.vision_feature_select_strategy
+    )
 ds = build_dataset_rank(processor, args.data_path)
 print(ds)
 
