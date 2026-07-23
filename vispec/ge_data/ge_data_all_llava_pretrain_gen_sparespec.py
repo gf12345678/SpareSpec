@@ -123,6 +123,7 @@ if getattr(processor, "vision_feature_select_strategy", None) is None:
     processor.vision_feature_select_strategy = (
         model_config.vision_feature_select_strategy
     )
+processor.num_additional_image_tokens = 1
 ds = build_dataset_rank(processor, args.data_path)
 print(ds)
 
