@@ -31,8 +31,10 @@ def load_data(args):
         os.path.join(args.data_folder, "llava_mme.jsonl"), "r", encoding="utf-8"
     ) as f:
         lines = f.readlines()
-        for l in lines:
+        for question_index, l in enumerate(lines):
             d = json.loads(l.strip())
+            # MME has two questions for each image/question_id.
+            d["question_index"] = question_index
             d["image"] = Image.open(
                 open(
                     os.path.join(
@@ -46,7 +48,13 @@ def load_data(args):
             d["text"] = d["text"].partition("\n")[0]
             data.append(d)
 
-    return Dataset.from_list(data).shuffle(seed=42).select(range(0, 100))
+    dataset = Dataset.from_list(data).shuffle(seed=42)
+    begin = 0 if args.question_begin is None else max(0, args.question_begin)
+    default_end = min(100, len(dataset))
+    end = default_end if args.question_end is None else min(args.question_end, len(dataset))
+    if begin >= end:
+        raise ValueError(f"Invalid MME question range: begin={begin}, end={end}")
+    return dataset.select(range(begin, end))
 
 
 def baseline_forward(
@@ -139,9 +147,10 @@ def baseline_forward(
         )
         input_ids = torch.cat([input_ids, input_id], dim=-1)
 
+        new_token += 1
         if tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
             break
-        if new_token > 1024:
+        if new_token >= max_steps:
             break
         # if input_ids.shape[1] > 1960:
         #     break
@@ -261,6 +270,7 @@ def get_model_answers(
             tokenizer=tokenizer,
             tree_choices=tree_choices,
             logits_processor=logits_processor,
+            max_steps=max_new_token,
         )
 
         torch.cuda.synchronize()
@@ -310,6 +320,7 @@ def get_model_answers(
                 tokenizer=tokenizer,
                 tree_choices=tree_choices,
                 logits_processor=logits_processor,
+                max_steps=max_new_token,
             )
             torch.cuda.synchronize()
             total_time = time.time() - start_time
@@ -353,6 +364,7 @@ def get_model_answers(
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
                 "question_id": d["question_id"],
+                "question_index": int(d["question_index"]),
                 "answer_id": shortuuid.uuid(),
                 "model_id": model_id,
                 "choices": choices,
@@ -362,14 +374,15 @@ def get_model_answers(
 
 
 def reorg_answer_file(answer_file):
-    """Sort by question id and de-duplication"""
+    """Sort retries without merging distinct MME questions."""
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
-            qid = json.loads(l)["question_id"]
-            answers[qid] = l
+            answer = json.loads(l)
+            key = (answer["question_id"], answer.get("question_index", -1))
+            answers[key] = l
 
-    qids = sorted(list(answers.keys()))
+    qids = sorted(answers)
     with open(answer_file, "w") as fout:
         for qid in qids:
             fout.write(answers[qid])

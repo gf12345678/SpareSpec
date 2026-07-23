@@ -722,13 +722,28 @@ class SpecModel(nn.Module):
                 # embed_weights,
             )
 
+            # A speculative step can append several tokens at once. Stop at
+            # the first EOS/EOT inside the accepted block and never count or
+            # return tokens after it. Also enforce max_new_tokens exactly
+            # instead of allowing a whole accepted block to overshoot.
+            generated = input_ids[0, input_len:]
+            stop_ids = [self.tokenizer.eos_token_id]
             if is_llama3:
-                if stop_token_id in input_ids[0, input_len:]:
-                    break
-
-            if self.tokenizer.eos_token_id in input_ids[0, input_len:]:
+                stop_ids.append(stop_token_id)
+            stop_positions = [
+                int(pos[0])
+                for stop_id in stop_ids
+                if stop_id is not None
+                for pos in torch.nonzero(generated == stop_id, as_tuple=False)
+            ]
+            if stop_positions:
+                generated_length = min(stop_positions) + 1
+                input_ids = input_ids[:, : input_len + generated_length]
+                new_token = generated_length
                 break
-            if new_token > max_new_tokens:
+            if generated.shape[0] >= max_new_tokens:
+                input_ids = input_ids[:, : input_len + max_new_tokens]
+                new_token = max_new_tokens
                 break
         # if input_ids.shape[1] > max_length:
         #     break

@@ -1,0 +1,53 @@
+{
+  "configuration": {
+    "base_model": "/data/gaofeng/model/Qwen2.5-VL-3B-Instruct",
+    "checkpoint": "vispec_data/Qwen2.5-VL-3B-Instruct/checkpoints/stage2/state_19",
+    "dataset": "/data/gaofeng/dataset/MME",
+    "samples": 100,
+    "temperature": 0,
+    "max_new_tokens": 1024,
+    "total_token": 30,
+    "depth": 3,
+    "top_k": 8,
+    "vis_select_tokens": 64,
+    "min_vis_select_tokens": 16,
+    "vis_query_window": 8,
+    "gpu": "4"
+  },
+  "metrics": {
+    "baseline": {
+      "samples": 100,
+      "tokens": 6702,
+      "wall_s": 131.34135222434998,
+      "tok_s": 51.02734124856593,
+      "ms_token": 19.597336947829003,
+      "correct": 78,
+      "accuracy": 0.78,
+      "invalid": 0,
+      "mean_acceptance": null,
+      "median_acceptance": null,
+      "acceptance_steps": 0
+    },
+    "sparespec": {
+      "samples": 100,
+      "tokens": 6617,
+      "wall_s": 68.65441393852234,
+      "tok_s": 96.3812757315982,
+      "ms_token": 10.375459262282355,
+      "correct": 78,
+      "accuracy": 0.78,
+      "invalid": 0,
+      "mean_acceptance": 2.3863636363636362,
+      "median_acceptance": 2.0,
+      "acceptance_steps": 1980
+    }
+  },
+  "comparison": {
+    "speedup_per_token": 1.888816335973744,
+    "speedup_total_generation_wall": 1.9130795048656541,
+    "same_indices": 100,
+    "yes_no_equal": 100,
+    "exact_text_equal": 49,
+    "token_count_equal": 57
+  }
+}

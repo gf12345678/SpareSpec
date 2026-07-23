@@ -285,26 +285,38 @@ def initialize_tree(
         text_attn_vis is None and vis_attn_scores is None and image_mask is not None
     )
     if should_collect_attn:
-        outputs, orig, hidden_states, base_attentions = model(
+        # Attention collection may force some backends (notably Qwen2.5-VL
+        # SDPA) onto eager attention. Do not reuse logits or KV state from
+        # that pass for authoritative target decoding.
+        _, _, _, base_attentions = model(
             input_ids,
             past_key_values=past_key_values,
             output_orig=True,
             inputs_embeds=inputs_embeds,
             return_attentions=True,
+            use_cache=True,
             **kwargs,
         )
+        # The custom KV backend requires a cache object even for attention
+        # collection. Reset its logical length so the authoritative prefill
+        # overwrites the selector pass completely.
+        reset_past_key_values(past_key_values)
         if base_attentions is not None and len(base_attentions) > 0:
             # Use middle LLM layer's attention for vision token selection
             middle_idx = len(base_attentions) // 2
             text_attn_vis = base_attentions[middle_idx]
-    else:
-        outputs, orig, hidden_states = model(
-            input_ids,
-            past_key_values=past_key_values,
-            output_orig=True,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+
+    # Always run the authoritative target prefill without returning
+    # attentions, matching ordinary autoregressive decoding.
+    outputs, orig, hidden_states = model(
+        input_ids,
+        past_key_values=past_key_values,
+        output_orig=True,
+        inputs_embeds=inputs_embeds,
+        return_attentions=False,
+        use_cache=True,
+        **kwargs,
+    )
 
     if logits_processor is not None:
         logits = orig[:, -1]

@@ -40,8 +40,10 @@ def load_data(args):
         os.path.join(args.data_folder, "llava_mme.jsonl"), "r", encoding="utf-8"
     ) as f:
         lines = f.readlines()
-        for l in lines:
+        for question_index, l in enumerate(lines):
             d = json.loads(l.strip())
+            # MME has two questions for each image/question_id.
+            d["question_index"] = question_index
             d["image"] = Image.open(
                 open(
                     os.path.join(
@@ -55,7 +57,13 @@ def load_data(args):
             d["text"] = d["text"].partition("\n")[0]
             data.append(d)
 
-    return Dataset.from_list(data).shuffle(seed=42).select(range(0, 100))
+    dataset = Dataset.from_list(data).shuffle(seed=42)
+    begin = 0 if args.question_begin is None else max(0, args.question_begin)
+    default_end = min(100, len(dataset))
+    end = default_end if args.question_end is None else min(args.question_end, len(dataset))
+    if begin >= end:
+        raise ValueError(f"Invalid MME question range: begin={begin}, end={end}")
+    return dataset.select(range(begin, end))
 
 
 def run_eval(
@@ -220,7 +228,10 @@ def get_model_answers(
         start_time = time.time()
 
         output_ids, new_token, idx = model.specgenerate(
-            **model_inputs, temperature=temperature, log=True
+            **model_inputs,
+            temperature=temperature,
+            max_new_tokens=max_new_token,
+            log=True,
         )
         torch.cuda.synchronize()
         total_time = time.time() - start_time
@@ -267,6 +278,7 @@ def get_model_answers(
             output_ids, new_token, idx, accp_len = model.specgenerate(
                 **model_inputs,
                 temperature=temperature,
+                max_new_tokens=max_new_token,
                 log=True,
                 return_acceptance_len=True,
             )
@@ -312,6 +324,7 @@ def get_model_answers(
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
                 "question_id": d["question_id"],
+                "question_index": int(d["question_index"]),
                 "answer_id": shortuuid.uuid(),
                 "model_id": model_id,
                 "choices": choices,
@@ -321,14 +334,15 @@ def get_model_answers(
 
 
 def reorg_answer_file(answer_file):
-    """Sort by question id and de-duplication"""
+    """Sort retries without merging distinct MME questions."""
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
-            qid = json.loads(l)["question_id"]
-            answers[qid] = l
+            answer = json.loads(l)
+            key = (answer["question_id"], answer.get("question_index", -1))
+            answers[key] = l
 
-    qids = sorted(list(answers.keys()))
+    qids = sorted(answers)
     with open(answer_file, "w") as fout:
         for qid in qids:
             fout.write(answers[qid])
