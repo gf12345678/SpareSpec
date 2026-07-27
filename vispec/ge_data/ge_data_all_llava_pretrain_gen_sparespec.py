@@ -361,6 +361,17 @@ def writedata(name, data_point, idx):
             pass
 
 
-for i, data in enumerate(tqdm(ds)):
+skipped = 0
+progress = tqdm(ds)
+
+for i, data in enumerate(progress):
+    final_path = os.path.join(outdir, f"data_{i}.ckpt")
+
+    if os.path.isfile(final_path):
+        skipped += 1
+        if skipped % 100 == 0:
+            progress.set_postfix(skipped=skipped)
+        continue
+
     outdata = ge(data)
     writedata(outdir, outdata, i)
