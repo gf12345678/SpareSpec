@@ -134,6 +134,9 @@ def get_model_answers(
     args,
 ):
     # temperature = 0.0
+    attention_kwargs = {}
+    if args.attn_implementation is not None:
+        attention_kwargs["attn_implementation"] = args.attn_implementation
 
     if args.use_sparespec:
         from ..model.spec_model_sparespec import SpecModel
@@ -155,6 +158,7 @@ def get_model_answers(
             vis_entropy_alpha=args.vis_entropy_alpha,
             vis_query_window=args.vis_query_window,
             max_total_vis_select_tokens=args.max_total_vis_select_tokens,
+            **attention_kwargs,
         )
     elif args.use_ours:
         from ..model.spec_model_ours import SpecModel
@@ -170,6 +174,7 @@ def get_model_answers(
             # load_in_8bit=True,
             device_map="auto",
             num_q=args.num_q,
+            **attention_kwargs,
         )
     elif args.use_medusa:
         from ..model.spec_model_medusa import SpecModel
@@ -184,6 +189,7 @@ def get_model_answers(
             low_cpu_mem_usage=True,
             # load_in_8bit=True,
             device_map="auto",
+            **attention_kwargs,
         )
     else:
         from ..model.spec_model import SpecModel
@@ -198,6 +204,7 @@ def get_model_answers(
             low_cpu_mem_usage=True,
             # load_in_8bit=True,
             device_map="auto",
+            **attention_kwargs,
         )
 
     tokenizer = model.get_tokenizer()
@@ -450,6 +457,13 @@ if __name__ == "__main__":
     parser.add_argument("--vis-entropy-alpha", type=float, default=1.2)
     parser.add_argument("--vis-query-window", type=int, default=8)
     parser.add_argument("--max-total-vis-select-tokens", type=int, default=0)
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("eager", "sdpa"),
+        default=None,
+        help="Force the base model attention backend. Use eager for a single "
+        "Qwen2.5-VL prefill that can also return selector attentions.",
+    )
 
     parser.add_argument("--data-folder", type=str, default="data/MME")
 

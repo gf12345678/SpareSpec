@@ -175,6 +175,7 @@ def run_eval(
     max_gpu_memory,
     temperature,
     tree_choices,
+    attn_implementation,
 ):
     data = load_data(args)
 
@@ -205,6 +206,7 @@ def run_eval(
                 max_gpu_memory,
                 temperature,
                 tree_choices,
+                attn_implementation,
             )
         )
 
@@ -225,9 +227,13 @@ def get_model_answers(
     max_gpu_memory,
     temperature,
     tree_choices,
+    attn_implementation,
 ):
     # temperature = 0.0
 
+    attention_kwargs = {}
+    if attn_implementation is not None:
+        attention_kwargs["attn_implementation"] = attn_implementation
     model = SpecModel.from_pretrained(
         base_model_path=base_model_path,
         spec_model_path=spec_model_path,
@@ -235,6 +241,7 @@ def get_model_answers(
         low_cpu_mem_usage=True,
         # load_in_8bit=True,
         device_map="auto",
+        **attention_kwargs,
     )
 
     tokenizer = model.get_tokenizer()
@@ -461,6 +468,12 @@ if __name__ == "__main__":
         type=str,
         default="mc_sim_7b_63",
     )
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("eager", "sdpa"),
+        default=None,
+        help="Force the base model attention backend.",
+    )
 
     parser.add_argument("--data-folder", type=str, default="data/MME")
 
@@ -496,6 +509,7 @@ if __name__ == "__main__":
         args.max_gpu_memory,
         args.temperature,
         args.tree_choices,
+        args.attn_implementation,
     )
 
     reorg_answer_file(answer_file)

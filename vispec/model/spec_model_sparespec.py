@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, AutoTokenizer
+from transformers.models.llava_next.modeling_llava_next import (
+    image_size_to_num_patches,
+)
 
 from .cnets_sparespec import Model
 from .configs import EConfig
@@ -242,18 +245,50 @@ class SpecModel(nn.Module):
             device = self.base_model.device
         return dtype, device
 
-    def _get_llava_vis_anchor(self, pixel_values, vision_feature_layer=None):
+    def _get_llava_image_features_and_anchor(
+        self,
+        pixel_values,
+        image_sizes,
+        vision_feature_layer,
+        vision_feature_select_strategy,
+    ):
         """
-        Extract visual anchor from the CLS token at ViT layer -2, then project
-        to LLM hidden space via the multi-modal projector.
+        Run the LLaVA vision tower once and derive both the normal patch
+        features and the global visual anchor from the shared outputs.
+
+        The patch path mirrors LlavaNextForConditionalGeneration.
+        get_image_features exactly. The anchor keeps SpareSpec's existing
+        definition: the projected CLS token from ViT layer -2, averaged over
+        AnyRes crops.
         """
         vision_tower = getattr(self.base_model, "vision_tower", None)
         projector = getattr(self.base_model, "multi_modal_projector", None)
         if pixel_values is None or vision_tower is None or projector is None:
-            return None
+            return None, None
 
+        image_num_patches = [
+            image_size_to_num_patches(
+                image_size=image_size,
+                grid_pinpoints=self.base_model.config.image_grid_pinpoints,
+                patch_size=self.base_model.config.vision_config.image_size,
+            )
+            for image_size in image_sizes
+        ]
         if pixel_values.dim() == 5:
-            pixel_values = pixel_values.reshape(-1, *pixel_values.shape[-3:])
+            pixel_values = torch.cat(
+                [
+                    image_pixels[:num_patches]
+                    for image_pixels, num_patches in zip(
+                        pixel_values, image_num_patches
+                    )
+                ],
+                dim=0,
+            )
+        elif pixel_values.dim() != 4:
+            raise ValueError(
+                f"pixel_values of shape {pixel_values.shape}, "
+                "expected 4 or 5 dimensions"
+            )
 
         vision_dtype, vision_device = self._get_module_dtype_device(vision_tower)
         if vision_dtype is not None:
@@ -264,17 +299,47 @@ class SpecModel(nn.Module):
         vision_outputs = vision_tower(
             pixel_values, output_hidden_states=True, return_dict=True
         )
-        # CLS token (position 0) from ViT layer -2
-        cls_token = vision_outputs.hidden_states[-2][:, 0]
 
         projector_dtype, projector_device = self._get_module_dtype_device(projector)
+        if isinstance(vision_feature_layer, int):
+            selected_image_feature = vision_outputs.hidden_states[
+                vision_feature_layer
+            ]
+        else:
+            selected_image_feature = torch.cat(
+                [
+                    vision_outputs.hidden_states[layer_idx]
+                    for layer_idx in vision_feature_layer
+                ],
+                dim=-1,
+            )
+
+        if vision_feature_select_strategy == "default":
+            selected_image_feature = selected_image_feature[:, 1:]
+        elif vision_feature_select_strategy != "full":
+            raise ValueError(
+                "vision_feature_select_strategy must be 'default' or 'full'"
+            )
+
+        if projector_dtype is not None:
+            selected_image_feature = selected_image_feature.to(
+                device=projector_device, dtype=projector_dtype
+            )
+        else:
+            selected_image_feature = selected_image_feature.to(
+                device=projector_device
+            )
+        image_features = projector(selected_image_feature)
+        image_features = torch.split(image_features, image_num_patches, dim=0)
+
+        cls_token = vision_outputs.hidden_states[-2][:, 0]
         if projector_dtype is not None:
             cls_token = cls_token.to(device=projector_device, dtype=projector_dtype)
         else:
             cls_token = cls_token.to(device=projector_device)
 
         vis_anchor = projector(cls_token)
-        return vis_anchor.mean(dim=0, keepdim=True)
+        return image_features, vis_anchor.mean(dim=0, keepdim=True)
 
     def forward(
         self,
@@ -485,17 +550,17 @@ class SpecModel(nn.Module):
                 inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
 
             if pixel_values is not None and pixel_values.size(0) > 0:
-                if vis_anchor is None:
-                    vis_anchor = self._get_llava_vis_anchor(
-                        pixel_values
-                    )
-
-                image_features = self.base_model.get_image_features(
+                (
+                    image_features,
+                    computed_vis_anchor,
+                ) = self._get_llava_image_features_and_anchor(
                     pixel_values,
                     image_sizes,
-                    vision_feature_layer=vision_feature_layer,
-                    vision_feature_select_strategy=vision_feature_select_strategy,
+                    vision_feature_layer,
+                    vision_feature_select_strategy,
                 )
+                if vis_anchor is None:
+                    vis_anchor = computed_vis_anchor
 
                 # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
                 image_features, feature_lens = self.base_model.pack_image_features(

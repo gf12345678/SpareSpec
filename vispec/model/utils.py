@@ -285,10 +285,19 @@ def initialize_tree(
         text_attn_vis is None and vis_attn_scores is None and image_mask is not None
     )
     if should_collect_attn:
-        # Attention collection may force some backends (notably Qwen2.5-VL
-        # SDPA) onto eager attention. Do not reuse logits or KV state from
-        # that pass for authoritative target decoding.
-        _, _, _, base_attentions = model(
+        architecture = model.base_model.config.architectures[0]
+        attn_implementation = getattr(
+            model.base_model.config, "_attn_implementation", None
+        )
+        attention_backend_changes = (
+            architecture == "Qwen2_5_VLForConditionalGeneration"
+            and attn_implementation != "eager"
+        )
+        # Collect the selector attention and perform the authoritative target
+        # prefill in the same pass. The returned logits/hidden states and the
+        # KV cache were produced by the same target model invocation, so they
+        # can normally be reused directly for tree verification.
+        _, orig, hidden_states, base_attentions = model(
             input_ids,
             past_key_values=past_key_values,
             output_orig=True,
@@ -297,26 +306,35 @@ def initialize_tree(
             use_cache=True,
             **kwargs,
         )
-        # The custom KV backend requires a cache object even for attention
-        # collection. Reset its logical length so the authoritative prefill
-        # overwrites the selector pass completely.
-        reset_past_key_values(past_key_values)
         if base_attentions is not None and len(base_attentions) > 0:
             # Use middle LLM layer's attention for vision token selection
             middle_idx = len(base_attentions) // 2
             text_attn_vis = base_attentions[middle_idx]
 
-    # Always run the authoritative target prefill without returning
-    # attentions, matching ordinary autoregressive decoding.
-    outputs, orig, hidden_states = model(
-        input_ids,
-        past_key_values=past_key_values,
-        output_orig=True,
-        inputs_embeds=inputs_embeds,
-        return_attentions=False,
-        use_cache=True,
-        **kwargs,
-    )
+        # Qwen2.5-VL switches from SDPA to eager attention when attentions are
+        # requested. Preserve its original authoritative SDPA prefill because
+        # reusing the eager cache changes generation results and is slower.
+        if attention_backend_changes:
+            reset_past_key_values(past_key_values)
+            _, orig, hidden_states = model(
+                input_ids,
+                past_key_values=past_key_values,
+                output_orig=True,
+                inputs_embeds=inputs_embeds,
+                return_attentions=False,
+                use_cache=True,
+                **kwargs,
+            )
+    else:
+        _, orig, hidden_states = model(
+            input_ids,
+            past_key_values=past_key_values,
+            output_orig=True,
+            inputs_embeds=inputs_embeds,
+            return_attentions=False,
+            use_cache=True,
+            **kwargs,
+        )
 
     if logits_processor is not None:
         logits = orig[:, -1]

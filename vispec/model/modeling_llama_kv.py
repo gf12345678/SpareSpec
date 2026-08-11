@@ -4,6 +4,7 @@
 
 """PyTorch LLaMA model."""
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -598,6 +599,50 @@ class LlamaAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Verification only needs the target logits/hidden states, not the
+        # attention probabilities. Use PyTorch SDPA for that path while
+        # retaining eager attention for the selector prefill, where
+        # output_attentions=True is required. The existing four-dimensional
+        # additive mask already contains both the prompt causal mask and
+        # SpareSpec's tree ancestry mask, so is_causal must remain False.
+        use_sdpa = (
+            not output_attentions
+            and os.environ.get("SPARESPEC_LLAVA_VERIFICATION_SDPA", "1")
+            not in {"0", "false", "False"}
+        )
+        if use_sdpa:
+            sdpa_mask = (
+                attention_mask.to(dtype=query_states.dtype)
+                if attention_mask is not None
+                else None
+            )
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=sdpa_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+            if self.pretraining_tp > 1:
+                attn_output = attn_output.split(
+                    self.hidden_size // self.pretraining_tp, dim=2
+                )
+                o_proj_slices = self.o_proj.weight.split(
+                    self.hidden_size // self.pretraining_tp, dim=1
+                )
+                attn_output = sum(
+                    F.linear(attn_output[i], o_proj_slices[i])
+                    for i in range(self.pretraining_tp)
+                )
+            else:
+                attn_output = self.o_proj(attn_output)
+
+            return attn_output, None, past_key_value
 
         attn_weights = torch.matmul(
             query_states, key_states.transpose(2, 3)
