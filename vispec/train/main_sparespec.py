@@ -197,6 +197,25 @@ for param in head.parameters():
     param.requires_grad = False
 
 
+def expected_stage2_anchor_type(config):
+    architectures = " ".join(getattr(config, "architectures", None) or []).lower()
+    model_type = str(getattr(config, "model_type", "")).lower()
+    identity = f"{architectures} {model_type} {args.basepath.lower()}"
+    if "qwen2_5_vl" in identity or "qwen2.5-vl" in identity:
+        return "qwen_penultimate_vit_attention_v1"
+    if "llava" in identity:
+        return "llava_penultimate_vit_cls_projected_v1"
+    raise ValueError(
+        "Stage 2 data validation does not know the anchor type for base model "
+        f"{args.basepath!r} (architectures={getattr(config, 'architectures', None)!r})"
+    )
+
+
+stage2_anchor_type = (
+    expected_stage2_anchor_type(baseconfig) if args.stage == 2 else None
+)
+
+
 def list_files(path):
     datapath = []
     for root, directories, files in os.walk(path):
@@ -240,12 +259,84 @@ class CustomDataset(Dataset):
         self.hidden_size = train_config.get("hidden_size", 3584)
         self.num_hidden_levels = args.num_hidden_levels
         self.stage = args.stage
+        self.expected_anchor_type = stage2_anchor_type
+
+    def _validate_stage2_data(self, data, path):
+        required = {
+            "inputs_embeds", "hidden_state", "loss_mask", "image_mask",
+            "query_token_mask", "vis_attn_scores", "vis_anchor",
+            "data_format_version", "anchor_type",
+        }
+        missing = sorted(required.difference(data))
+        if missing:
+            raise ValueError(f"Invalid Stage 2 ckpt {path}: missing fields {missing}")
+        if data["data_format_version"] != 2:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: expected data_format_version=2, "
+                f"got {data['data_format_version']!r}"
+            )
+        if data["anchor_type"] != self.expected_anchor_type:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: base model requires anchor_type="
+                f"{self.expected_anchor_type!r}, got {data['anchor_type']!r}"
+            )
+
+        seq_len = data["hidden_state"].shape[0]
+        sequence_fields = (
+            "inputs_embeds", "loss_mask", "image_mask",
+            "query_token_mask", "vis_attn_scores",
+        )
+        bad_lengths = {}
+        for name in sequence_fields:
+            value = data[name]
+            if not torch.is_tensor(value) or value.dim() == 0:
+                bad_lengths[name] = f"non-sequence value {type(value).__name__}"
+            elif value.shape[0] != seq_len:
+                bad_lengths[name] = value.shape[0]
+        if bad_lengths:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: expected sequence length {seq_len}, "
+                f"got {bad_lengths}"
+            )
+        expected_multi_hidden = self.num_hidden_levels * self.hidden_size
+        if data["hidden_state"].dim() != 2 or data["hidden_state"].shape[1] != expected_multi_hidden:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: hidden_state must be [seq, "
+                f"{expected_multi_hidden}], got {tuple(data['hidden_state'].shape)}"
+            )
+        if data["inputs_embeds"].dim() != 2 or data["inputs_embeds"].shape[1] != self.hidden_size:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: inputs_embeds must be [seq, "
+                f"{self.hidden_size}], got {tuple(data['inputs_embeds'].shape)}"
+            )
+        anchor = data["vis_anchor"]
+        if not torch.is_tensor(anchor) or tuple(anchor.shape) != (1, self.hidden_size):
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: vis_anchor must have shape "
+                f"(1, {self.hidden_size}), got {getattr(anchor, 'shape', None)}"
+            )
+        image_mask = data["image_mask"].to(torch.bool)
+        query_mask = data["query_token_mask"].to(torch.bool)
+        scores = data["vis_attn_scores"].float()
+        if not image_mask.any():
+            raise ValueError(f"Invalid Stage 2 ckpt {path}: image_mask has no visual tokens")
+        if not query_mask.any():
+            raise ValueError(f"Invalid Stage 2 ckpt {path}: query_token_mask is empty")
+        image_scores = scores[image_mask]
+        if not torch.isfinite(image_scores).all() or image_scores.clamp_min(0).sum() <= 0:
+            raise ValueError(
+                f"Invalid Stage 2 ckpt {path}: visual attention scores are absent, "
+                "non-finite, or all zero"
+            )
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        data = torch.load(self.data[index])
+        path = self.data[index]
+        data = torch.load(path)
+        if self.stage == 2:
+            self._validate_stage2_data(data, path)
         new_data = {}
         hidden_state = data["hidden_state"][: train_config["max_len"]][None, :]
         inputs_embeds = data["inputs_embeds"][: train_config["max_len"]][None, :]
@@ -744,8 +835,15 @@ num_epochs = train_config["num_epochs"]
 updates_per_epoch = max(
     math.ceil(len(train_loader) / train_config["gradient_accumulation_steps"]), 1
 )
-num_warmup_steps = updates_per_epoch
-total_steps = max(updates_per_epoch * num_epochs, 1)
+total_steps = max(
+    args.max_train_steps
+    if args.max_train_steps > 0
+    else updates_per_epoch * num_epochs,
+    1,
+)
+# Preserve the one-epoch warmup for normal training, but always leave at least
+# one non-warmup optimizer update in explicitly step-limited runs.
+num_warmup_steps = min(updates_per_epoch, max(total_steps - 1, 0))
 is_warmup = train_config["is_warmup"]
 
 if is_warmup:
@@ -767,7 +865,7 @@ elif is_warmup and args.begin_epoch > 0:
     for _ in range(args.begin_epoch * updates_per_epoch):
         scheduler.step()
 
-global_train_steps = 0
+global_train_steps = 0  # completed optimizer updates, not micro-batches
 
 for epoch in range(args.begin_epoch, num_epochs):
     if args.max_train_steps > 0 and global_train_steps >= args.max_train_steps:
@@ -813,6 +911,10 @@ for epoch in range(args.begin_epoch, num_epochs):
                     model.parameters(), train_config["grad_clip"]
                 )
             optimizer.step()
+            did_optimizer_update = (
+                accelerator.sync_gradients
+                and not accelerator.optimizer_step_was_skipped
+            )
             if is_warmup:
                 scheduler.step()
 
@@ -856,7 +958,8 @@ for epoch in range(args.begin_epoch, num_epochs):
         epoch_vloss += vloss.item()
         epoch_ploss += ploss.item()
         num_batches += 1
-        global_train_steps += 1
+        if did_optimizer_update:
+            global_train_steps += 1
 
         del ploss, vloss
         if args.max_train_steps > 0 and global_train_steps >= args.max_train_steps:

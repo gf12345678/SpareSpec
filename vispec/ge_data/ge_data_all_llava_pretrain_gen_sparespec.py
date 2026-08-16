@@ -20,7 +20,7 @@ args = parser.parse_args()
 import os
 import random
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
 import json
 from typing import Dict
@@ -64,6 +64,7 @@ def build_dataset_rank(processor, path):
     ds = Dataset.from_list(ds)
     ds = ds.shuffle(seed=42)
     ds1: Dataset = ds.select(range(args.start, args.end))
+    ds1 = ds1.add_column("source_index", list(range(args.start, args.end)))
     original_columns1 = ds1.column_names
 
     def preprocess_function(examples):
@@ -103,6 +104,7 @@ def build_dataset_rank(processor, path):
             "image_files": [image_file],
             "text": prompt_input,
             "query_text": "\n".join(query_texts),
+            "source_index": examples["source_index"],
         }
         return outputs
 
@@ -148,13 +150,16 @@ print(f"[SpareSpec Stage2] Model: {bigname}, n_layers={n_layers}")
 print(f"  shallow_idx={shallow_idx}, middle_idx={middle_idx}, deep_idx={deep_idx}")
 
 
-def _extract_recent_vis_attn_scores(
-    generate_outputs, target_len, layer_idx, image_mask, query_window, query_token_mask
+def _extract_prompt_vis_attn_scores(
+    attentions, target_len, layer_idx, image_mask, query_window, query_token_mask
 ):
-    attentions = getattr(generate_outputs, "attentions", None)
-    if attentions is None:
+    """Reduce one prompt-prefill attention layer without retaining decode attention."""
+    if attentions is None or len(attentions) == 0:
         return None
-
+    layer_idx = min(max(layer_idx, 0), len(attentions) - 1)
+    layer_attn = attentions[layer_idx]
+    if not torch.is_tensor(layer_attn) or layer_attn.dim() != 4:
+        return None
     image_mask = image_mask[:target_len].to(torch.bool).cpu()
     vis_ids = torch.where(image_mask)[0]
     query_token_mask = query_token_mask[:target_len].to(torch.bool).cpu()
@@ -164,49 +169,14 @@ def _extract_recent_vis_attn_scores(
 
     query_window = min(query_window, text_ids.numel())
     query_ids = text_ids[-query_window:]
-    query_set = {int(idx): row for row, idx in enumerate(query_ids.tolist())}
-    score_sum = torch.zeros(vis_ids.numel(), dtype=torch.float32)
-    score_count = 0
-
-    row_start = 0
-    for step_attn in attentions:
-        if step_attn is None:
-            continue
-        if isinstance(step_attn, (tuple, list)):
-            if len(step_attn) == 0:
-                continue
-            attn_idx = layer_idx if layer_idx >= 0 else len(step_attn) + layer_idx
-            attn_idx = min(max(attn_idx, 0), len(step_attn) - 1)
-            step_attn = step_attn[attn_idx]
-        if isinstance(step_attn, (tuple, list)):
-            if len(step_attn) == 0:
-                continue
-            step_attn = step_attn[0]
-        if not torch.is_tensor(step_attn) or step_attn.dim() < 4:
-            continue
-
-        attn = step_attn[0].float().mean(dim=0).cpu()
-        q_len = min(attn.shape[-2], target_len - row_start)
-        if q_len <= 0:
-            break
-        valid_vis = vis_ids[vis_ids < min(attn.shape[-1], target_len)]
-        if valid_vis.numel() == 0:
-            row_start += q_len
-            continue
-        valid_vis_order = torch.searchsorted(vis_ids, valid_vis)
-        for local_row in range(q_len):
-            global_row = row_start + local_row
-            if global_row not in query_set:
-                continue
-            score_sum[valid_vis_order] += attn[local_row, valid_vis]
-            score_count += 1
-        row_start += q_len
-
-    if score_count == 0:
+    attn = layer_attn[0].float().mean(dim=0).cpu()
+    query_ids = query_ids[query_ids < attn.shape[-2]]
+    vis_ids = vis_ids[vis_ids < attn.shape[-1]]
+    if query_ids.numel() == 0 or vis_ids.numel() == 0:
         return None
-
+    scores = attn[query_ids][:, vis_ids].mean(dim=0)
     vis_attn_scores = torch.zeros(target_len, dtype=torch.float16)
-    vis_attn_scores[vis_ids] = (score_sum / score_count).to(torch.float16)
+    vis_attn_scores[vis_ids] = scores.to(torch.float16)
     return vis_attn_scores
 
 
@@ -276,11 +246,30 @@ def ge(data: Dict):
     if "pixel_values" in inputs and inputs["pixel_values"] is not None:
         vis_anchor = extract_vis_anchor_llava(inputs["pixel_values"])
 
+    input_len = inputs["input_ids"].shape[-1]
+    image_token_id = bigmodel.config.image_token_index
+    prompt_image_mask = (inputs["input_ids"][0] == image_token_id).cpu()
+    prompt_query_mask = _build_query_token_mask(
+        inputs["input_ids"], data["query_text"], input_len,
+        input_len, prompt_image_mask,
+    )
+    prompt_vis_attn_scores = None
+    if args.save_attentions:
+        selector_outputs = bigmodel(
+            **inputs, output_attentions=True, output_hidden_states=False,
+            use_cache=False, return_dict=True,
+        )
+        prompt_vis_attn_scores = _extract_prompt_vis_attn_scores(
+            selector_outputs.attentions, input_len, middle_idx - 1,
+            prompt_image_mask, args.vis_query_window, prompt_query_mask,
+        )
+        del selector_outputs
+
     # Generate with output_hidden_states
     outs_big = bigmodel.generate(
         **inputs,
         output_hidden_states=True,
-        output_attentions=args.save_attentions,
+        output_attentions=False,
         return_dict_in_generate=True,
         max_new_tokens=args.max_new_tokens,
         do_sample=args.temperature != 0,
@@ -302,11 +291,9 @@ def ge(data: Dict):
     inputs_embeds_big = torch.cat(inputs_embeds_list, dim=1)
 
     # image_mask over the full generated sequence
-    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
     image_mask = (outs_big.sequences == image_token_id)[..., :-1]  # [1, total_seq-1]
 
     # loss_mask: only on assistant response (generated part)
-    input_len = inputs["input_ids"].shape[-1]
     loss_mask = torch.ones(outs_big.sequences[:, :-1].shape, dtype=bool)
     loss_mask[:, : input_len - 1] = 0
     query_token_mask = _build_query_token_mask(
@@ -323,25 +310,23 @@ def ge(data: Dict):
         "loss_mask": loss_mask.cpu()[0],                     # [total_seq]
         "image_mask": image_mask.cpu()[0],                   # [total_seq]
         "query_token_mask": query_token_mask,                # [total_seq]
+        "source_index": int(data["source_index"]),
+        "data_format_version": 2,
+        "anchor_type": "llava_penultimate_vit_cls_projected_v1",
     }
     if vis_anchor is not None:
         td["vis_anchor"] = vis_anchor.cpu()                  # [1, H]
     if args.save_attentions:
-        vis_attn_scores = _extract_recent_vis_attn_scores(
-            outs_big,
-            td["hidden_state"].shape[0],
-            middle_idx - 1,
-            td["image_mask"],
-            args.vis_query_window,
-            td["query_token_mask"],
-        )
-        if vis_attn_scores is not None:
-            td["vis_attn_scores"] = vis_attn_scores
+        if prompt_vis_attn_scores is None:
+            raise RuntimeError("Could not extract prompt text-to-vision attention scores")
+        vis_attn_scores = torch.zeros(td["hidden_state"].shape[0], dtype=torch.float16)
+        vis_attn_scores[:input_len] = prompt_vis_attn_scores
+        td["vis_attn_scores"] = vis_attn_scores
 
     return td
 
 
-outdir = f"{args.outdir}/{args.index}"
+outdir = args.outdir
 if not os.path.exists(outdir):
     os.makedirs(outdir)
 
@@ -364,8 +349,9 @@ def writedata(name, data_point, idx):
 skipped = 0
 progress = tqdm(ds)
 
-for i, data in enumerate(progress):
-    final_path = os.path.join(outdir, f"data_{i}.ckpt")
+for data in progress:
+    source_index = int(data["source_index"])
+    final_path = os.path.join(outdir, f"data_{source_index}.ckpt")
 
     if os.path.isfile(final_path):
         skipped += 1
@@ -374,4 +360,4 @@ for i, data in enumerate(progress):
         continue
 
     outdata = ge(data)
-    writedata(outdir, outdata, i)
+    writedata(outdir, outdata, source_index)

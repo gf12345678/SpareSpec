@@ -1248,6 +1248,14 @@ class Model(nn.Module):
         ).round().long()
 
     def _entropy_adaptive_budget(self, scores, num_vis_tokens, max_budget=None):
+        """Map normalized attention entropy to a token budget.
+
+        ``scores`` are already non-negative attention weights, so applying a
+        second softmax would make their small values almost uniform.  Normalize
+        them directly, compute H(p) / log(N), then map [0, 1] onto the configured
+        [min_budget, max_budget] interval. ``vis_entropy_alpha`` is the curve
+        exponent: values > 1 bias toward smaller budgets.
+        """
         if max_budget is None:
             max_budget = self.vis_select_tokens
         max_budget = min(max_budget, num_vis_tokens)
@@ -1255,14 +1263,26 @@ class Model(nn.Module):
         if max_budget <= min_budget:
             return max_budget
 
-        scores = scores.float()
-        scores = scores - scores.max()
-        probs = torch.softmax(scores, dim=-1)
+        if self.vis_entropy_alpha <= 0:
+            raise ValueError("vis_entropy_alpha must be positive")
+
+        weights = scores.float().clamp_min(0)
+        weight_sum = weights.sum()
+        if not torch.isfinite(weight_sum) or weight_sum <= 0:
+            # No usable attention signal: keep the conservative maximum budget.
+            return max_budget
+
+        probs = weights / weight_sum
         entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum()
-        effective_tokens = torch.exp(entropy)
-        keep_num = int(torch.ceil(self.vis_entropy_alpha * effective_tokens).item())
-        keep_num = max(min_budget, keep_num)
-        keep_num = min(max_budget, keep_num)
+        max_entropy = math.log(max(int(probs.numel()), 2))
+        normalized_entropy = (entropy / max_entropy).clamp(0.0, 1.0)
+        budget_ratio = normalized_entropy.pow(self.vis_entropy_alpha)
+        keep_num = int(
+            torch.ceil(
+                min_budget + budget_ratio * (max_budget - min_budget)
+            ).item()
+        )
+        keep_num = max(min_budget, min(keep_num, max_budget))
         return keep_num
 
     def _score_visual_ids(

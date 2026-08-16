@@ -12,7 +12,7 @@ args = parser.parse_args()
 import os
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
 
 import torch
@@ -69,13 +69,16 @@ def build_dataset_rank(
         ds = load_dataset("Aeala/ShareGPT_Vicuna_unfiltered")["train"]
     ds = ds.shuffle(seed=42)
     ds1 = ds.select(range(args.start, args.end))
+    ds1 = ds1.add_column("source_index", list(range(args.start, args.end)))
     original_columns1 = ds1.column_names
     # original_columns2 = ds2.column_names
     num_proc = 1
 
     def preprocess_function(examples):
-        new_examples = {"conversation": [], "input_ids": [], "loss_mask": []}
-        for row_idx in range(len(examples["id"])):
+        new_examples = {
+            "conversation": [], "input_ids": [], "loss_mask": [], "source_index": []
+        }
+        for row_idx in range(len(examples["conversations"])):
             conv = get_conversation_template("vicuna")
             roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
             source = examples["conversations"][row_idx]
@@ -120,41 +123,27 @@ def build_dataset_rank(
                 max_length=tokenizer.model_max_length,
                 truncation=True,
             ).input_ids[0]
-            loss_mask = torch.ones_like(input_ids)
-            # print(i)
-
-            sep = conv.sep + conv.roles[1] + ": "
-
-            total_len = int(input_ids.ne(tokenizer.pad_token_id).sum())
-
-            turns = conversation.split(conv.sep2)
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
+            full_ids = input_ids.tolist()
+            loss_mask = torch.zeros_like(input_ids)
+            spans_valid = True
+            for message_idx, (role, _) in enumerate(conv.messages):
+                if role != conv.roles[1]:
+                    continue
+                before_conv = get_conversation_template("vicuna")
+                before_conv.messages = [list(x) for x in conv.messages[:message_idx]]
+                before_conv.append_message(role, None)
+                after_conv = get_conversation_template("vicuna")
+                after_conv.messages = [list(x) for x in conv.messages[: message_idx + 1]]
+                before_ids = tokenizer(before_conv.get_prompt()).input_ids
+                after_ids = tokenizer(after_conv.get_prompt()).input_ids
+                if after_ids[: len(before_ids)] != before_ids or full_ids[: len(after_ids)] != after_ids:
+                    spans_valid = False
                     break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    instruction_len -= 1
-
-                # Ignore the user instructions
-                loss_mask[cur_len : cur_len + instruction_len] = 0
-                cur_len += turn_len
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    cur_len -= 1
-
-            loss_mask[cur_len:] = 0
+                start = min(len(before_ids), input_ids.numel())
+                end = min(len(after_ids), input_ids.numel())
+                loss_mask[start:end] = 1
+            if not spans_valid:
+                continue
 
             if input_ids.numel() == 0 or loss_mask.sum().item() == 0:
                 continue
@@ -162,6 +151,7 @@ def build_dataset_rank(
             new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
+            new_examples["source_index"].append(examples["source_index"][row_idx])
 
         return new_examples
 
@@ -217,11 +207,13 @@ def ge(data):
         "input_ids": input_ids.cpu()[0],
         "hidden_state": hidden_state_big.cpu()[0],
         "loss_mask": data["loss_mask"].cpu()[0],
+        "source_index": int(data["source_index"]),
+        "data_format_version": 2,
     }
     return td
 
 
-outdir = f"{args.outdir}/{args.index}"
+outdir = args.outdir
 if not os.path.exists(outdir):
     os.makedirs(outdir)
 
@@ -241,6 +233,6 @@ def writedata(name, data_point, idx):
             pass
 
 
-for i, data in enumerate(tqdm(ds)):
+for data in tqdm(ds):
     outdata = ge(data)
-    writedata(outdir, outdata, i)
+    writedata(outdir, outdata, outdata["source_index"])

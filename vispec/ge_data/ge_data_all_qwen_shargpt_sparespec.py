@@ -16,7 +16,7 @@ args = parser.parse_args()
 import os
 import json
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
 import torch
 from datasets import Dataset, load_dataset
@@ -68,17 +68,20 @@ def build_dataset_rank(tokenizer, split="train", select=None):
     ds = _load_sharegpt_dataset(args.data_path)
     ds = ds.shuffle(seed=42)
     ds1 = ds.select(range(args.start, args.end))
+    ds1 = ds1.add_column("source_index", list(range(args.start, args.end)))
     original_columns1 = ds1.column_names
     num_proc = 2
 
     def preprocess_function(examples):
-        new_examples = {"conversation": [], "input_ids": [], "loss_mask": []}
+        new_examples = {
+            "conversation": [], "input_ids": [], "loss_mask": [], "source_index": []
+        }
         convroles = ["user", "assistant"]
         roles = {"human": "user", "gpt": "assistant"}
-        if not tokenizer.pad_token_id:
+        if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.unk_token_id
 
-        for row_idx in range(len(examples["id"])):
+        for row_idx in range(len(examples["conversations"])):
             source = examples["conversations"][row_idx]
             if not source:
                 continue
@@ -101,51 +104,56 @@ def build_dataset_rank(tokenizer, split="train", select=None):
             if not valid or len(messages) <= 1:
                 continue
 
-            conversation = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+            full_ids = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False,
             )
-            input_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                max_length=2048,
-                truncation=True,
-                add_special_tokens=False,
-            ).input_ids[0]
+            if torch.is_tensor(full_ids):
+                full_ids = full_ids.reshape(-1).tolist()
+            elif full_ids and isinstance(full_ids[0], list):
+                full_ids = full_ids[0]
+            input_ids = torch.tensor(full_ids[:2048], dtype=torch.long)
             if input_ids.numel() == 0:
                 continue
 
-            loss_mask = torch.ones_like(input_ids)
-            sep = "<|im_end|>\n<|im_start|>assistant\n"
-            sep2 = "<|im_end|>\n<|im_start|>user\n"
-            turns = conversation.split(sep2)
-            if len(turns) < 2:
+            # Derive assistant spans from the tokenizer's own chat template.  This
+            # remains correct if Qwen special-token lengths or separators change.
+            loss_mask = torch.zeros_like(input_ids)
+            spans_valid = True
+            for message_idx, message in enumerate(messages):
+                if message["role"] != "assistant":
+                    continue
+                before_ids = tokenizer.apply_chat_template(
+                    messages[:message_idx], tokenize=True, add_generation_prompt=True,
+                )
+                after_ids = tokenizer.apply_chat_template(
+                    messages[: message_idx + 1], tokenize=True, add_generation_prompt=False,
+                )
+                if torch.is_tensor(before_ids):
+                    before_ids = before_ids.reshape(-1).tolist()
+                if torch.is_tensor(after_ids):
+                    after_ids = after_ids.reshape(-1).tolist()
+                if before_ids and isinstance(before_ids[0], list):
+                    before_ids = before_ids[0]
+                if after_ids and isinstance(after_ids[0], list):
+                    after_ids = after_ids[0]
+                if after_ids[: len(before_ids)] != before_ids or full_ids[: len(after_ids)] != after_ids:
+                    spans_valid = False
+                    break
+                start = min(len(before_ids), input_ids.numel())
+                end = min(len(after_ids), input_ids.numel())
+                loss_mask[start:end] = 1
+            if not spans_valid:
                 continue
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for turn_idx, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                instruction_len = len(tokenizer(parts[0]).input_ids)
-                if turn_idx == 0:
-                    loss_mask[0 : cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 6 : cur_len + instruction_len - 2] = 0
-                cur_len += turn_len
-                cur_len += 5
-            loss_mask[cur_len:] = 0
             if loss_mask.sum().item() == 0:
                 continue
 
+            conversation = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
             new_examples["conversation"].append(conversation)
             new_examples["input_ids"].append(input_ids[None, :])
             new_examples["loss_mask"].append(loss_mask[None, :])
+            new_examples["source_index"].append(examples["source_index"][row_idx])
         return new_examples
 
     ds1 = ds1.map(
@@ -196,11 +204,13 @@ def ge(data):
         "input_ids": input_ids.cpu()[0],
         "hidden_state": hidden_state_big.cpu()[0],
         "loss_mask": data["loss_mask"].cpu()[0],
+        "source_index": int(data["source_index"]),
+        "data_format_version": 2,
     }
     return td
 
 
-outdir = f"{args.outdir}/{args.index}"
+outdir = args.outdir
 if not os.path.exists(outdir):
     os.makedirs(outdir)
 
@@ -220,6 +230,6 @@ def writedata(name, data_point, idx):
             pass
 
 
-for i, data in enumerate(tqdm(dataset)):
+for data in tqdm(dataset):
     outdata = ge(data)
-    writedata(outdir, outdata, i)
+    writedata(outdir, outdata, outdata["source_index"])

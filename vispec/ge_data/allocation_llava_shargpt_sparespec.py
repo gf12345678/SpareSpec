@@ -11,12 +11,17 @@ parser.add_argument("--gpus_per_model", type=int, default=1)
 args = parser.parse_args()
 
 import os
+import subprocess
 import torch
 from concurrent.futures import ThreadPoolExecutor
 
 s = args.start
 e = args.end
 num_p = torch.cuda.device_count()
+if args.gpus_per_model <= 0:
+    raise ValueError("--gpus_per_model must be positive")
+if num_p == 0:
+    raise RuntimeError("No visible CUDA devices")
 visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 visible_device_ids = None
 if visible_devices:
@@ -35,47 +40,47 @@ num_p = len(gpus)
 outdir = "{}/llava_v1.6_shargpt_sparespec_{}_{}_mubf16".format(args.outdir, s, e)
 
 
-def split_range(start, end, n, over=False):
-    length = end - start + 1
+def split_range(start, end, n):
+    if end <= start:
+        raise ValueError(f"Expected --end > --start, got [{start}, {end})")
+    n = min(n, end - start)
+    length = end - start
     base_interval = length // n
     additional = length % n
     intervals = []
     previous = start
     for i in range(n):
         current_interval = base_interval + (1 if i < additional else 0)
-        if over:
-            intervals.append((previous, previous + current_interval))
-        else:
-            intervals.append((previous, previous + current_interval - 1))
+        intervals.append((previous, previous + current_interval))
         previous += current_interval
     return intervals
 
 
 def run_command(cmd):
-    os.system(cmd)
+    print(" ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
 
 
 if not os.path.exists(outdir):
     os.makedirs(outdir)
 
-data_a = split_range(s, e, num_p, over=True)
+data_a = split_range(s, e, num_p)
 commands = []
-for i in range(num_p):
+for i in range(len(data_a)):
     index = i
     start, end = data_a[i]
     gpu_index = gpus[i]
-    gpu_index_str = " ".join(map(str, gpu_index))
-    command = (
-        "{} -m vispec.ge_data.ge_data_all_llava_shargpt_sparespec "
-        "--start={} --end={} --index={} --gpu_index {} --outdir {} --model {}".format(
-            sys.executable, start, end, index, gpu_index_str, outdir, args.model
-        )
-    )
+    command = [
+        sys.executable, "-m", "vispec.ge_data.ge_data_all_llava_shargpt_sparespec",
+        "--start", str(start), "--end", str(end), "--index", str(index),
+        "--gpu_index", *map(str, gpu_index), "--outdir", outdir,
+        "--model", args.model,
+    ]
     if args.data_path:
-        command += f" --data-path {args.data_path}"
+        command += ["--data-path", args.data_path]
     commands.append(command)
 
 with ThreadPoolExecutor(max_workers=len(commands)) as executor:
-    for command in commands:
-        executor.submit(run_command, command)
-        print(command)
+    futures = [executor.submit(run_command, command) for command in commands]
+    for future in futures:
+        future.result()

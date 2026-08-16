@@ -117,7 +117,7 @@ Stage2 train:
   --loadpath PATH              Stage1 checkpoint model.safetensors.
   --vis-select-tokens N        Global selected visual-token cap if max-total is 0. Default: 64
   --min-vis-select-tokens N    Entropy budget floor. Default: 16
-  --vis-entropy-alpha FLOAT    Entropy budget multiplier. Default: 1.2
+  --vis-entropy-alpha FLOAT    Normalized-entropy curve exponent (>1 keeps fewer tokens). Default: 1.2
   --vis-query-window N         Recent/query text tokens for selector. Default: 8
   --max-total-vis-select-tokens N  Explicit global visual-token cap. 0 disables.
 
